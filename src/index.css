@@ -1,0 +1,174 @@
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Open+Sans:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Brand Colors */
+    --background: 0 0% 100%;
+    --foreground: 210 29% 17%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 210 29% 17%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 210 29% 17%;
+
+    /* Deep Blue - Primary Brand */
+    --primary: 211 66% 17%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Light Gray - Secondary */
+    --secondary: 210 20% 96%;
+    --secondary-foreground: 210 29% 17%;
+
+    --muted: 210 20% 96%;
+    --muted-foreground: 210 10% 50%;
+
+    /* Gold Accent */
+    --accent: 43 74% 49%;
+    --accent-foreground: 0 0% 100%;
+
+    /* Red for discounts */
+    --destructive: 0 84% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 210 20% 90%;
+    --input: 210 20% 90%;
+    --ring: 211 66% 17%;
+
+    --radius: 0.75rem;
+
+    /* Custom brand tokens */
+    --gold: 43 74% 49%;
+    --gold-light: 43 74% 60%;
+    --deep-blue: 211 66% 17%;
+    --deep-blue-light: 211 50% 25%;
+    --sale-red: 0 84% 50%;
+    --sale-red-dark: 0 84% 40%;
+    --trust-green: 142 71% 45%;
+
+    /* Gradients */
+    --gradient-gold: linear-gradient(135deg, hsl(43 74% 49%), hsl(43 74% 60%));
+    --gradient-blue: linear-gradient(135deg, hsl(211 66% 17%), hsl(211 50% 30%));
+    --gradient-premium: linear-gradient(135deg, hsl(211 66% 17%), hsl(211 66% 25%), hsl(43 74% 49%));
+
+    /* Shadows */
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --shadow-card: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+    --shadow-hover: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+    --shadow-gold: 0 4px 14px 0 hsl(43 74% 49% / 0.3);
+
+    /* Sidebar */
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+    --background: 210 29% 10%;
+    --foreground: 0 0% 98%;
+    --card: 210 29% 12%;
+    --card-foreground: 0 0% 98%;
+    --popover: 210 29% 12%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 43 74% 49%;
+    --primary-foreground: 210 29% 10%;
+    --secondary: 210 20% 18%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 210 20% 18%;
+    --muted-foreground: 210 10% 60%;
+    --accent: 43 74% 49%;
+    --accent-foreground: 210 29% 10%;
+    --destructive: 0 84% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 210 20% 20%;
+    --input: 210 20% 20%;
+    --ring: 43 74% 49%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-body antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-heading font-semibold tracking-tight;
+  }
+}
+
+@layer components {
+  .container-custom {
+    @apply w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
+  }
+
+  .card-product {
+    @apply bg-card rounded-xl overflow-hidden transition-all duration-300 hover:shadow-hover;
+    box-shadow: var(--shadow-card);
+  }
+
+  .card-product:hover {
+    transform: translateY(-4px);
+  }
+
+  .btn-gold {
+    @apply bg-accent text-accent-foreground font-semibold px-6 py-3 rounded-lg transition-all duration-300;
+    box-shadow: var(--shadow-gold);
+  }
+
+  .btn-gold:hover {
+    @apply bg-accent/90;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px 0 hsl(43 74% 49% / 0.4);
+  }
+
+  .badge-sale {
+    @apply bg-destructive text-destructive-foreground text-xs font-bold px-2 py-1 rounded-md;
+  }
+
+  .badge-premium {
+    background: var(--gradient-gold);
+    @apply text-white text-xs font-bold px-2 py-1 rounded-md;
+  }
+
+  .text-gradient-gold {
+    background: var(--gradient-gold);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .bg-gradient-premium {
+    background: var(--gradient-premium);
+  }
+
+  .bg-gradient-blue {
+    background: var(--gradient-blue);
+  }
+
+  .input-search {
+    @apply bg-secondary border-0 rounded-full px-4 py-2 text-sm focus:ring-2 focus:ring-accent transition-all;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
