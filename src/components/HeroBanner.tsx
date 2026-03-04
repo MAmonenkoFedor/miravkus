@@ -77,11 +77,11 @@ export function HeroBanner() {
 
           {/* Image placeholder */}
           <div className="hidden lg:flex justify-center">
-            <div className="relative w-[400px] h-[400px]">
+            <div className="relative w-[360px] xl:w-[420px] aspect-[4/5]">
               <div className="absolute inset-0 bg-gradient-to-br from-gold/20 to-transparent rounded-full animate-pulse" />
               <div className="absolute inset-8 bg-white/5 backdrop-blur-sm rounded-3xl border border-white/10 overflow-hidden">
                 <div className="relative w-full h-full">
-                  <img src={imageSrc} alt={title} className="w-full h-full object-cover" />
+                  <img src={imageSrc} alt={title} className="w-full h-full object-contain" />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/10 to-transparent" />
                   <div className="absolute top-4 left-4">
                     <span className="badge-premium text-xs px-3 py-1">{badge}</span>

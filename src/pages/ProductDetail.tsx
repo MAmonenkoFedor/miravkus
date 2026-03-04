@@ -138,11 +138,11 @@ const ProductDetail = () => {
           <div className="grid lg:grid-cols-2 gap-8 lg:gap-12">
             {/* Gallery */}
             <div className="space-y-4">
-              <div className="relative aspect-square bg-secondary rounded-2xl overflow-hidden">
+              <div className="relative aspect-[4/5] w-[80%] mx-auto bg-secondary rounded-2xl overflow-hidden">
                 <img
                   src={images[selectedImage]}
                   alt={product.name}
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain"
                 />
                 <div className="absolute top-4 left-4 flex flex-col gap-2">
                   {product.discount && (
@@ -164,7 +164,7 @@ const ProductDetail = () => {
                         selectedImage === idx ? 'border-primary' : 'border-transparent'
                       }`}
                     >
-                      <img src={img} alt="" className="w-full h-full object-cover" />
+                      <img src={img} alt="" className="w-full h-full object-contain" />
                     </button>
                   ))}
                 </div>
@@ -230,7 +230,7 @@ const ProductDetail = () => {
                   <Truck className="w-5 h-5 text-primary" />
                   <div>
                     <p className="font-medium text-sm">Доставка</p>
-                    <p className="text-xs text-muted-foreground">от 1-3 дней</p>
+                    <p className="text-xs text-muted-foreground">от 1 дня</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
@@ -312,8 +312,8 @@ function ProductReviewsSection({ productId }: { productId: string }) {
 
   return (
     <section className="mt-12 pt-12 border-t border-border">
-      <h2 className="font-heading font-bold text-2xl mb-6">Отзывы ({reviews.length})</h2>
-      <ReviewsList reviews={reviews} />
+      <h2 className="font-heading font-bold text-2xl mb-6">Отзывы ({Array.isArray(reviews) ? reviews.length : 0})</h2>
+      <ReviewsList reviews={Array.isArray(reviews) ? reviews : []} />
       <div className="mt-8">
         <ReviewForm
           productId={productId}

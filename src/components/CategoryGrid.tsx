@@ -9,9 +9,9 @@ export function CategoryGrid() {
       <section className="py-8 sm:py-12 bg-secondary">
         <div className="container-custom">
           <h2 className="font-heading font-bold text-xl sm:text-2xl mb-6 text-center">Категории товаров</h2>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+          <div className="flex flex-wrap justify-center gap-4">
             {[...Array(6)].map((_, i) => (
-              <div key={i} className="bg-card rounded-xl p-4 h-32 animate-pulse" />
+              <div key={i} className="bg-card rounded-xl p-4 h-32 basis-[calc(50%-8px)] sm:basis-[calc(33.333%-10.666px)] lg:basis-[calc(16.666%-13.333px)]" />
             ))}
           </div>
         </div>
@@ -28,12 +28,12 @@ export function CategoryGrid() {
           Категории товаров
         </h2>
         
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="flex flex-wrap justify-center gap-4">
           {categories.map((category) => (
             <Link
               key={category.id}
               to={`/catalog?category=${category.slug}`}
-              className="group"
+              className="group basis-[calc(50%-8px)] sm:basis-[calc(33.333%-10.666px)] lg:basis-[calc(16.666%-13.333px)]"
             >
               <div className="bg-card rounded-xl p-4 text-center transition-all duration-300 hover:shadow-hover hover:-translate-y-1">
                 <div className="w-16 h-16 sm:w-20 sm:h-20 mx-auto mb-3 rounded-full bg-secondary flex items-center justify-center group-hover:bg-primary/10 transition-colors overflow-hidden">
