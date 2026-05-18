@@ -22,11 +22,22 @@ interface Banner {
   is_active: boolean;
   position: string;
   sort_order: number;
+  starts_at: string | null;
+  ends_at: string | null;
 }
 
 const emptyForm = {
   title: "", subtitle: "", discount: "", link_url: "", link_text: "",
-  variant: "gold", is_active: true, position: "promo", sort_order: 0,
+  variant: "gold", is_active: true, position: "promo", sort_order: 0, starts_at: "", ends_at: "",
+};
+
+const toDateTimeLocal = (value: string | null) => {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  const offset = parsed.getTimezoneOffset();
+  const local = new Date(parsed.getTime() - offset * 60_000);
+  return local.toISOString().slice(0, 16);
 };
 
 const Banners = () => {
@@ -51,6 +62,8 @@ const Banners = () => {
       title: b.title, subtitle: b.subtitle || "", discount: b.discount || "",
       link_url: b.link_url || "", link_text: b.link_text || "", variant: b.variant,
       is_active: b.is_active, position: b.position, sort_order: b.sort_order,
+      starts_at: toDateTimeLocal(b.starts_at),
+      ends_at: toDateTimeLocal(b.ends_at),
     });
     setIsOpen(true);
   };
@@ -62,6 +75,8 @@ const Banners = () => {
       ...form,
       subtitle: form.subtitle || null, discount: form.discount || null,
       link_url: form.link_url || null, link_text: form.link_text || null,
+      starts_at: form.starts_at ? new Date(form.starts_at).toISOString() : null,
+      ends_at: form.ends_at ? new Date(form.ends_at).toISOString() : null,
     };
 
     if (editing) {
@@ -114,6 +129,7 @@ const Banners = () => {
               <TableHead>Вариант</TableHead>
               <TableHead>Позиция</TableHead>
               <TableHead>Активен</TableHead>
+              <TableHead>Период</TableHead>
               <TableHead className="w-24">Действия</TableHead>
             </TableRow>
           </TableHeader>
@@ -128,6 +144,11 @@ const Banners = () => {
                 </TableCell>
                 <TableCell>{b.position}</TableCell>
                 <TableCell>{b.is_active ? "✅" : "❌"}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">
+                  {(b.starts_at || b.ends_at)
+                    ? `${b.starts_at ? new Date(b.starts_at).toLocaleString("ru-RU") : "сейчас"} - ${b.ends_at ? new Date(b.ends_at).toLocaleString("ru-RU") : "бессрочно"}`
+                    : "Без ограничений"}
+                </TableCell>
                 <TableCell>
                   <div className="flex gap-1">
                     <Button variant="ghost" size="icon" onClick={() => openEdit(b)}><Pencil className="w-4 h-4" /></Button>
@@ -137,7 +158,7 @@ const Banners = () => {
               </TableRow>
             ))}
             {banners.length === 0 && (
-              <TableRow><TableCell colSpan={5} className="text-center py-8 text-muted-foreground">Нет баннеров</TableCell></TableRow>
+              <TableRow><TableCell colSpan={6} className="text-center py-8 text-muted-foreground">Нет баннеров</TableCell></TableRow>
             )}
           </TableBody>
         </Table>
@@ -171,6 +192,7 @@ const Banners = () => {
                   <SelectContent>
                     <SelectItem value="gold">Золотой</SelectItem>
                     <SelectItem value="red">Красный</SelectItem>
+                    <SelectItem value="default">По умолчанию</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -181,6 +203,7 @@ const Banners = () => {
                   <SelectContent>
                     <SelectItem value="hero">Главный баннер</SelectItem>
                     <SelectItem value="promo">Промо</SelectItem>
+                    <SelectItem value="home">На главной (home)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -199,6 +222,24 @@ const Banners = () => {
               <Switch checked={form.is_active} onCheckedChange={v => setForm({ ...form, is_active: v })} />
               <span className="text-sm">Активен</span>
             </label>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label>Показывать с</Label>
+                <Input
+                  type="datetime-local"
+                  value={form.starts_at}
+                  onChange={(e) => setForm({ ...form, starts_at: e.target.value })}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Показывать до</Label>
+                <Input
+                  type="datetime-local"
+                  value={form.ends_at}
+                  onChange={(e) => setForm({ ...form, ends_at: e.target.value })}
+                />
+              </div>
+            </div>
             <div className="flex justify-end gap-3 pt-2">
               <Button variant="outline" onClick={() => setIsOpen(false)}>Отмена</Button>
               <Button onClick={handleSave} disabled={saving}>{saving ? "Сохранение..." : "Сохранить"}</Button>

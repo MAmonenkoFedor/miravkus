@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8081";
+const API_BASE = import.meta.env.VITE_API_URL || "";
 const TOKEN_KEY = "auth_token";
 
 export type ApiError = Error & { status?: number };
@@ -50,6 +50,12 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
 
   if (!response.ok) {
     const message = typeof data === "string" ? data : data?.error || "Ошибка запроса";
+    if (response.status === 401) {
+      clearToken();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("auth:unauthorized"));
+      }
+    }
     throw buildApiError(message, response.status);
   }
 

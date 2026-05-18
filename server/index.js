@@ -4,6 +4,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
+import nodemailer from "nodemailer";
 import { Pool } from "pg";
 import {
   randomInt,
@@ -17,6 +18,7 @@ import { z } from "zod";
 import { pathToFileURL } from "url";
 
 const app = express();
+app.disable("x-powered-by");
 
 const basePort = Number.parseInt(process.env.BACKEND_PORT ?? process.env.PORT ?? "8081", 10);
 const allowedOrigins = (process.env.BACKEND_ALLOWED_ORIGIN ??
@@ -60,12 +62,53 @@ const deliveries = new Map();
 const smsRequests = new Map();
 const smsRateLimits = new Map();
 const smsPhoneIndex = new Map();
+const rateLimits = new Map();
 
 const smsOtpTtlMs = Number.parseInt(process.env.SMS_OTP_TTL_MS ?? "300000", 10);
 const smsMaxAttempts = Number.parseInt(process.env.SMS_OTP_MAX_ATTEMPTS ?? "5", 10);
 const smsRateLimitWindowMs = Number.parseInt(process.env.SMS_OTP_RATE_WINDOW_MS ?? "600000", 10);
 const smsRateLimitMax = Number.parseInt(process.env.SMS_OTP_RATE_MAX ?? "3", 10);
 const smsOtpSecret = process.env.SMS_OTP_SECRET ?? "dev-secret";
+const isProd = process.env.NODE_ENV === "production";
+const webhookSecret = process.env.WEBHOOK_SECRET;
+
+const pruneTimestamps = (timestamps, windowMs) => {
+  const now = Date.now();
+  return timestamps.filter((ts) => now - ts <= windowMs);
+};
+
+const takeRateLimit = (key, windowMs, max) => {
+  const now = Date.now();
+  const log = pruneTimestamps(rateLimits.get(key) ?? [], windowMs);
+  if (log.length >= max) {
+    rateLimits.set(key, log);
+    return false;
+  }
+  rateLimits.set(key, [...log, now]);
+  return true;
+};
+
+const rateLimit = ({ prefix, windowMs, max, keyFn }) => (req, res, next) => {
+  const key = `${prefix}:${keyFn(req)}`;
+  if (!takeRateLimit(key, windowMs, max)) {
+    res.status(429).json({ error: "rate_limited" });
+    return;
+  }
+  next();
+};
+
+const requireWebhook = (req, res, next) => {
+  if (!webhookSecret) {
+    res.status(503).json({ error: "webhook_unavailable" });
+    return;
+  }
+  const provided = req.get("x-webhook-secret");
+  if (!provided || !safeEqual(provided, webhookSecret)) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  next();
+};
 
 const normalizePhone = (value) => {
   const raw = value.trim();
@@ -151,8 +194,7 @@ const pruneRateLimits = (timestamps) => {
 };
 
 const paymentCreateSchema = z.object({
-  orderId: z.string().min(1),
-  amount: z.number().positive(),
+  orderId: z.string().uuid(),
   currency: z.string().min(1).default("RUB"),
 });
 
@@ -198,6 +240,47 @@ const deliveryWebhookSchema = z.object({
   providerPayload: z.record(z.unknown()).optional(),
 });
 
+const orderCreateSchema = z.object({
+  order_number: z.string().min(1),
+  status: z.string().min(1).optional(),
+  delivery_price: z.number().min(0).max(1000000).optional(),
+  delivery_method: z.string().min(1).optional().nullable(),
+  payment_method: z.string().min(1).optional().nullable(),
+  address: z.string().min(1).optional().nullable(),
+  profile_name: z.string().min(1).optional(),
+  items: z
+    .array(
+      z.object({
+        product_id: z.string().uuid(),
+        quantity: z.number().int().positive(),
+      }),
+    )
+    .min(1)
+    .max(200),
+});
+
+const guestOrderCreateSchema = orderCreateSchema.extend({
+  customer_email: z.string().email(),
+});
+
+const profileUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+});
+
+const addressPayloadSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  recipient_name: z.string().trim().min(1).max(120),
+  phone: z.string().trim().min(6).max(30),
+  city: z.string().trim().min(1).max(120),
+  street: z.string().trim().min(1).max(200),
+  building: z.string().trim().min(1).max(40),
+  apartment: z.string().trim().max(40).optional().nullable(),
+  entrance: z.string().trim().max(40).optional().nullable(),
+  floor: z.string().trim().max(40).optional().nullable(),
+  comment: z.string().trim().max(500).optional().nullable(),
+  is_default: z.boolean().optional(),
+});
+
 const smsRequestSchema = z.object({
   phone: z.string().min(6),
   purpose: z.string().min(1).optional(),
@@ -215,6 +298,14 @@ const smsWebhookSchema = z.object({
   providerPayload: z.record(z.unknown()).optional(),
 });
 
+const reviewCreateSchema = z.object({
+  product_id: z.string().uuid(),
+  order_id: z.string().uuid(),
+  rating: z.number().int().min(1).max(5),
+  text: z.string().min(1).max(2000),
+  author_name: z.string().max(100).nullable().optional(),
+});
+
 const authLoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
@@ -230,7 +321,938 @@ const authOtpVerifySchema = z.object({
   code: z.string().min(4),
 });
 
+const authEmailOtpRequestSchema = z.object({
+  email: z.string().email(),
+});
+
+const authEmailOtpVerifySchema = z.object({
+  requestId: z.string().min(1),
+  email: z.string().email(),
+  code: z.string().min(4),
+});
+
+const adminOrderStatuses = ["Новый", "В обработке", "Отправлен", "Доставлен"];
+
+const adminProductPayloadSchema = z.object({
+  name: z.string().min(1).max(300),
+  slug: z.string().trim().min(1).max(200).optional().nullable(),
+  category_id: z.string().uuid().optional().nullable(),
+  price: z.coerce.number().positive().max(10000000),
+  old_price: z.coerce.number().nonnegative().max(10000000).optional().nullable(),
+  description: z.string().max(20000).optional().nullable(),
+  images: z.array(z.string().max(2048)).max(30).optional().nullable(),
+  meta_title: z.string().max(300).optional().nullable(),
+  meta_description: z.string().max(1000).optional().nullable(),
+  meta_keywords: z.string().max(1000).optional().nullable(),
+  seo_text: z.string().max(30000).optional().nullable(),
+  product_type: z.enum(["regular", "gift", "premium"]).optional(),
+  in_stock: z.boolean().optional(),
+  stock_count: z.coerce.number().int().min(0).max(100000).optional().nullable(),
+  rating: z.coerce.number().min(0).max(5).optional(),
+  reviews_count: z.coerce.number().int().min(0).max(1000000).optional(),
+  is_premium: z.boolean().optional(),
+  is_new: z.boolean().optional(),
+  sort_order: z.coerce.number().int().min(0).max(100000).optional(),
+  category_ids: z.array(z.string().uuid()).max(30).optional(),
+});
+
+const adminCategoryPayloadSchema = z.object({
+  name: z.string().min(1).max(200),
+  slug: z.string().trim().min(1).max(200),
+  image: z.string().max(2048).optional().nullable(),
+  emoji: z.string().max(16).optional().nullable(),
+  sort_order: z.coerce.number().int().min(0).max(100000).optional(),
+});
+
+const adminOrderStatusUpdateSchema = z.object({
+  status: z.enum(adminOrderStatuses),
+});
+
+const adminReviewStatuses = ["pending", "published", "rejected"];
+
+const adminReviewCreateSchema = z.object({
+  user_id: z.string().uuid(),
+  product_id: z.string().uuid(),
+  order_id: z.string().uuid().optional().nullable(),
+  rating: z.coerce.number().int().min(1).max(5),
+  text: z.string().min(1).max(2000),
+  author_name: z.string().max(100).optional().nullable(),
+  status: z.enum(adminReviewStatuses).optional(),
+});
+
+const adminReviewStatusUpdateSchema = z.object({
+  status: z.enum(adminReviewStatuses),
+});
+
+const adminPageUpdateSchema = z.object({
+  title: z.string().min(1).max(300),
+  content: z.string().max(200000).optional(),
+});
+
+const adminBannerPayloadSchema = z.object({
+  title: z.string().min(1).max(300),
+  subtitle: z.string().max(500).optional().nullable(),
+  discount: z.string().max(100).optional().nullable(),
+  link_url: z.string().max(2048).optional().nullable(),
+  link_text: z.string().max(200).optional().nullable(),
+  variant: z.enum(["gold", "red", "default"]).optional(),
+  image: z.string().max(2048).optional().nullable(),
+  position: z.enum(["hero", "promo", "home"]).optional(),
+  is_active: z.boolean().optional(),
+  sort_order: z.coerce.number().int().min(0).max(100000).optional(),
+  starts_at: z.string().max(100).optional().nullable(),
+  ends_at: z.string().max(100).optional().nullable(),
+});
+
+const adminHeroPayloadSchema = z.object({
+  product_id: z.string().uuid(),
+  badge: z.string().max(100).optional().nullable(),
+  is_active: z.boolean().optional(),
+  sort_order: z.coerce.number().int().min(0).max(100000).optional(),
+  starts_at: z.string().max(100).optional().nullable(),
+  ends_at: z.string().max(100).optional().nullable(),
+});
+
+const homeSectionKeys = [
+  "hero",
+  "trust",
+  "categories",
+  "gift_sets",
+  "promo_banners",
+  "premium",
+  "truffles",
+  "discounts",
+  "popular",
+  "articles",
+];
+
+const homeLayoutSectionSchema = z.object({
+  key: z.enum(homeSectionKeys),
+  enabled: z.boolean(),
+  title: z.string().max(120).optional(),
+  viewAllLink: z.string().max(500).optional(),
+  badge: z.string().max(80).optional(),
+  productIds: z.array(z.string().uuid()).max(30).optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+
+const homeHeroSchema = z.object({
+  topBadge: z.string().max(120).optional(),
+  headline: z.string().max(200).optional(),
+  highlight: z.string().max(120).optional(),
+  description: z.string().max(500).optional(),
+  primaryCtaText: z.string().max(80).optional(),
+  primaryCtaLink: z.string().max(500).optional(),
+  secondaryCtaText: z.string().max(80).optional(),
+  secondaryCtaLink: z.string().max(500).optional(),
+  feature1: z.string().max(120).optional(),
+  feature2: z.string().max(120).optional(),
+});
+
+const trustIconKeys = ["truck", "shield", "rotate", "headphones"];
+
+const homeTrustItemSchema = z.object({
+  icon: z.enum(trustIconKeys).optional(),
+  title: z.string().max(120),
+  description: z.string().max(200),
+});
+
+const homeLayoutSchema = z
+  .object({
+    sections: z.array(homeLayoutSectionSchema).min(1).max(20),
+    featuredCategoryIds: z.array(z.string().uuid()).max(20).optional(),
+    seo: z
+      .object({
+        title: z.string().max(120).optional(),
+        description: z.string().max(500).optional(),
+        keywords: z.string().max(500).optional(),
+      })
+      .optional(),
+    hero: homeHeroSchema.optional(),
+    trust: z.array(homeTrustItemSchema).min(1).max(8).optional(),
+  })
+  .superRefine((value, ctx) => {
+    const keys = new Set();
+    for (const section of value.sections) {
+      if (keys.has(section.key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["sections"],
+          message: "duplicate_section_key",
+        });
+        return;
+      }
+      keys.add(section.key);
+    }
+  });
+
+const homeLayoutPresetKeys = ["default", "holiday", "sale"];
+
+const homeLayoutPresetSchema = z.object({
+  preset: z.enum(homeLayoutPresetKeys),
+  apply: z
+    .object({
+      sections: z.boolean().optional(),
+      featuredCategoryIds: z.boolean().optional(),
+      seo: z.boolean().optional(),
+      hero: z.boolean().optional(),
+      trust: z.boolean().optional(),
+    })
+    .optional(),
+});
+
+const homeLayoutPresets = [
+  {
+    key: "default",
+    label: "Обычный день",
+    description: "Стандартная витрина магазина",
+  },
+  {
+    key: "holiday",
+    label: "Праздник",
+    description: "Акцент на подарки и премиум",
+  },
+  {
+    key: "sale",
+    label: "Распродажа",
+    description: "Акцент на скидки и промо",
+  },
+];
+
+const buildDefaultClientMessages = () => ({
+  authNotice:
+    "Сейчас доступны вход и подтверждение по email. Вход по SMS будет добавлен следующим этапом.",
+  checkoutNotice: "Подтверждение заказа отправляем на email. SMS-уведомления подключим позже.",
+});
+
+const clientMessagesSchema = z.object({
+  authNotice: z.string().max(500).optional().nullable(),
+  checkoutNotice: z.string().max(500).optional().nullable(),
+});
+
+const integrationProviderSchema = z.object({
+  sms: z.object({
+    provider: z.enum(["none", "smsc"]).optional(),
+    smscLogin: z.string().max(200).optional().nullable(),
+    smscPassword: z.string().max(200).optional().nullable(),
+    sender: z.string().max(50).optional().nullable(),
+  }).optional(),
+  delivery: z
+    .object({
+      provider: z.enum(["none", "cdek", "yandex", "ozon"]).optional(),
+      cdekClientId: z.string().max(300).optional().nullable(),
+      cdekClientSecret: z.string().max(300).optional().nullable(),
+      yandexApiKey: z.string().max(400).optional().nullable(),
+      ozonClientId: z.string().max(300).optional().nullable(),
+      ozonApiKey: z.string().max(300).optional().nullable(),
+    })
+    .optional(),
+  payment: z
+    .object({
+      provider: z.enum(["none", "manual", "ozon"]).optional(),
+      ozonPaymentKey: z.string().max(300).optional().nullable(),
+    })
+    .optional(),
+  mail: z
+    .object({
+      provider: z.enum(["none", "smtp"]).optional(),
+      smtpHost: z.string().max(200).optional().nullable(),
+      smtpPort: z.coerce.number().int().min(1).max(65535).optional().nullable(),
+      smtpSecure: z.boolean().optional().nullable(),
+      smtpUser: z.string().max(200).optional().nullable(),
+      fromEmail: z.string().max(200).optional().nullable(),
+      smtpPassword: z.string().max(300).optional().nullable(),
+      notifyToEmail: z.string().max(200).optional().nullable(),
+      postalCode: z.string().max(30).optional().nullable(),
+    })
+    .optional(),
+});
+
+const hexColorSchema = z
+  .string()
+  .max(20)
+  .transform((value) => value.trim())
+  .refine((value) => /^#?[0-9a-fA-F]{6}$/.test(value), { message: "invalid_hex" })
+  .transform((value) => (value.startsWith("#") ? value.toUpperCase() : `#${value.toUpperCase()}`));
+
+const legacyThemePaletteSchema = z.object({
+  background: hexColorSchema,
+  card: hexColorSchema,
+  foreground: hexColorSchema,
+  primary: hexColorSchema,
+  accent: hexColorSchema,
+  secondary: hexColorSchema,
+  muted: hexColorSchema,
+  mutedForeground: hexColorSchema,
+  border: hexColorSchema,
+  saleRed: hexColorSchema,
+  heroStart: hexColorSchema,
+  heroEnd: hexColorSchema,
+});
+
+const themePaletteSchema = z.object({
+  background: hexColorSchema,
+  card: hexColorSchema,
+  foreground: hexColorSchema,
+  primary: hexColorSchema,
+  accent: hexColorSchema,
+  secondary: hexColorSchema,
+  muted: hexColorSchema,
+  mutedForeground: hexColorSchema,
+  border: hexColorSchema,
+  saleRed: hexColorSchema,
+  heroBackground: hexColorSchema,
+  heroGradientStart: hexColorSchema,
+  heroGradientEnd: hexColorSchema,
+  heroText: hexColorSchema,
+  heroDecor: hexColorSchema,
+});
+
+const themeSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  preset: z.string().max(50).optional().nullable(),
+  palette: z.union([themePaletteSchema, legacyThemePaletteSchema]).optional(),
+  assets: z
+    .object({
+      backgroundMode: z.enum(["color", "image"]).optional().nullable(),
+      siteBackgroundImage: z.string().max(500).optional().nullable(),
+      siteBackgroundOverlay: hexColorSchema.optional().nullable(),
+      siteBackgroundOverlayOpacity: z.coerce.number().min(0).max(1).optional().nullable(),
+    })
+    .optional()
+    .nullable(),
+});
+
+const buildDefaultThemeSettings = () => ({
+  enabled: false,
+  preset: "premium_light",
+  palette: {
+    background: "#F7F9FC",
+    card: "#FFFFFF",
+    foreground: "#172033",
+    primary: "#123A63",
+    accent: "#D9A441",
+    secondary: "#EEF2F7",
+    muted: "#EEF2F7",
+    mutedForeground: "#6B7280",
+    border: "#E5E7EB",
+    saleRed: "#D92D20",
+    heroBackground: "#F7F9FC",
+    heroGradientStart: "#FFFFFF",
+    heroGradientEnd: "#EEF2F7",
+    heroText: "#172033",
+    heroDecor: "#D9A441",
+  },
+  assets: {
+    backgroundMode: "color",
+    siteBackgroundImage: "",
+    siteBackgroundOverlay: "#FFFFFF",
+    siteBackgroundOverlayOpacity: 0,
+  },
+});
+
+const normalizeThemeSettings = (rawValue) => {
+  const defaults = buildDefaultThemeSettings();
+  const parsed = themeSettingsSchema.safeParse(rawValue);
+  if (!parsed.success) return defaults;
+  const value = parsed.data;
+  const palette = value.palette ?? defaults.palette;
+  const assets = value.assets ?? defaults.assets;
+  if ("heroStart" in palette || "heroEnd" in palette) {
+    const legacy = palette;
+    return {
+      enabled: typeof value.enabled === "boolean" ? value.enabled : defaults.enabled,
+      preset: typeof value.preset === "string" && value.preset.trim().length ? value.preset.trim() : defaults.preset,
+      palette: {
+        background: legacy.background ?? defaults.palette.background,
+        card: legacy.card ?? defaults.palette.card,
+        foreground: legacy.foreground ?? defaults.palette.foreground,
+        primary: legacy.primary ?? defaults.palette.primary,
+        accent: legacy.accent ?? defaults.palette.accent,
+        secondary: legacy.secondary ?? defaults.palette.secondary,
+        muted: legacy.muted ?? defaults.palette.muted,
+        mutedForeground: legacy.mutedForeground ?? defaults.palette.mutedForeground,
+        border: legacy.border ?? defaults.palette.border,
+        saleRed: legacy.saleRed ?? defaults.palette.saleRed,
+        heroBackground: defaults.palette.heroBackground,
+        heroGradientStart: legacy.heroStart ?? defaults.palette.heroGradientStart,
+        heroGradientEnd: legacy.heroEnd ?? defaults.palette.heroGradientEnd,
+        heroText: defaults.palette.heroText,
+        heroDecor: defaults.palette.heroDecor,
+      },
+      assets,
+    };
+  }
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : defaults.enabled,
+    preset: typeof value.preset === "string" && value.preset.trim().length ? value.preset.trim() : defaults.preset,
+    palette,
+    assets,
+  };
+};
+
+const getThemeSettings = async () => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'theme_settings' LIMIT 1`);
+  const raw = rows[0]?.value ?? buildDefaultThemeSettings();
+  return normalizeThemeSettings(raw);
+};
+
+const buildDefaultIntegrationSettings = () => ({
+  sms: {
+    provider: process.env.SMS_PROVIDER === "smsc" ? "smsc" : "none",
+    smscLogin: process.env.SMSC_LOGIN ?? "",
+    smscPassword: process.env.SMSC_PASSWORD ?? "",
+    sender: process.env.SMSC_SENDER ?? "",
+  },
+  delivery: {
+    provider: ["cdek", "yandex", "ozon"].includes(process.env.DELIVERY_PROVIDER ?? "")
+      ? process.env.DELIVERY_PROVIDER
+      : "none",
+    cdekClientId: process.env.CDEK_CLIENT_ID ?? "",
+    cdekClientSecret: process.env.CDEK_CLIENT_SECRET ?? "",
+    yandexApiKey: process.env.YANDEX_DELIVERY_API_KEY ?? "",
+    ozonClientId: process.env.OZON_CLIENT_ID ?? "",
+    ozonApiKey: process.env.OZON_API_KEY ?? "",
+  },
+  payment: {
+    provider: ["manual", "ozon"].includes(process.env.PAYMENT_PROVIDER ?? "")
+      ? process.env.PAYMENT_PROVIDER
+      : "manual",
+    ozonPaymentKey: process.env.OZON_PAYMENT_KEY ?? "",
+  },
+  mail: {
+    provider: process.env.MAIL_PROVIDER === "smtp" ? "smtp" : "none",
+    smtpHost: process.env.MAIL_SMTP_HOST ?? "",
+    smtpPort: (() => {
+      const port = Number.parseInt(process.env.MAIL_SMTP_PORT ?? "465", 10);
+      return Number.isFinite(port) ? port : 465;
+    })(),
+    smtpSecure: process.env.MAIL_SMTP_SECURE ? process.env.MAIL_SMTP_SECURE === "true" : true,
+    smtpUser: process.env.MAIL_SMTP_USER ?? "",
+    fromEmail: process.env.MAIL_FROM_EMAIL ?? "",
+    smtpPassword: process.env.MAIL_SMTP_PASSWORD ?? "",
+    notifyToEmail: process.env.MAIL_NOTIFY_TO_EMAIL ?? "",
+    postalCode: process.env.MAIL_POSTAL_CODE ?? "",
+  },
+});
+
+const cleanString = (value) => (typeof value === "string" ? value.trim() : "");
+
+const normalizeIntegrationSettings = (rawValue) => {
+  const defaults = buildDefaultIntegrationSettings();
+  const parsed = integrationProviderSchema.safeParse(rawValue);
+  if (!parsed.success) {
+    return defaults;
+  }
+  const value = parsed.data;
+  return {
+    sms: {
+      provider: value.sms?.provider ?? defaults.sms.provider,
+      smscLogin: cleanString(value.sms?.smscLogin) || defaults.sms.smscLogin,
+      smscPassword: cleanString(value.sms?.smscPassword) || defaults.sms.smscPassword,
+      sender: cleanString(value.sms?.sender) || defaults.sms.sender,
+    },
+    delivery: {
+      provider: value.delivery?.provider ?? defaults.delivery.provider,
+      cdekClientId: cleanString(value.delivery?.cdekClientId) || defaults.delivery.cdekClientId,
+      cdekClientSecret: cleanString(value.delivery?.cdekClientSecret) || defaults.delivery.cdekClientSecret,
+      yandexApiKey: cleanString(value.delivery?.yandexApiKey) || defaults.delivery.yandexApiKey,
+      ozonClientId: cleanString(value.delivery?.ozonClientId) || defaults.delivery.ozonClientId,
+      ozonApiKey: cleanString(value.delivery?.ozonApiKey) || defaults.delivery.ozonApiKey,
+    },
+    payment: {
+      provider: value.payment?.provider ?? defaults.payment.provider,
+      ozonPaymentKey: cleanString(value.payment?.ozonPaymentKey) || defaults.payment.ozonPaymentKey,
+    },
+    mail: {
+      provider: value.mail?.provider ?? defaults.mail.provider,
+      smtpHost: cleanString(value.mail?.smtpHost) || defaults.mail.smtpHost,
+      smtpPort: Number.isFinite(value.mail?.smtpPort) ? value.mail.smtpPort : defaults.mail.smtpPort,
+      smtpSecure: typeof value.mail?.smtpSecure === "boolean" ? value.mail.smtpSecure : defaults.mail.smtpSecure,
+      smtpUser: cleanString(value.mail?.smtpUser) || defaults.mail.smtpUser,
+      fromEmail: cleanString(value.mail?.fromEmail) || defaults.mail.fromEmail,
+      smtpPassword: cleanString(value.mail?.smtpPassword) || defaults.mail.smtpPassword,
+      notifyToEmail: cleanString(value.mail?.notifyToEmail) || defaults.mail.notifyToEmail,
+      postalCode: cleanString(value.mail?.postalCode) || defaults.mail.postalCode,
+    },
+  };
+};
+
+const canSendMail = (settings) => {
+  if (settings.mail.provider !== "smtp") return false;
+  if (!settings.mail.smtpHost) return false;
+  if (!settings.mail.smtpPort) return false;
+  if (!settings.mail.smtpUser) return false;
+  if (!settings.mail.smtpPassword) return false;
+  if (!settings.mail.fromEmail) return false;
+  return true;
+};
+
+const sendMailWithSmtp = async (settings, { to, subject, text, html }) => {
+  if (!canSendMail(settings)) {
+    throw new Error("mail_not_configured");
+  }
+  const transporter = nodemailer.createTransport({
+    host: settings.mail.smtpHost,
+    port: settings.mail.smtpPort,
+    secure: Boolean(settings.mail.smtpSecure),
+    auth: {
+      user: settings.mail.smtpUser,
+      pass: settings.mail.smtpPassword,
+    },
+  });
+  const from = settings.mail.fromEmail;
+  await transporter.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    ...(html ? { html } : {}),
+  });
+};
+
+const formatRub = (value) => {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return new Intl.NumberFormat("ru-RU").format(n) + " ₽";
+};
+
+const buildOrderEmailText = ({ orderNumber, totalPrice, deliveryPrice, deliveryMethod, paymentMethod, address, items }) => {
+  const lines = [];
+  lines.push(`Заказ №${orderNumber}`);
+  lines.push("");
+  lines.push("Состав заказа:");
+  for (const item of items) {
+    const name = item.product_name || item.productName || "Товар";
+    const qty = item.quantity ?? 1;
+    const price = typeof item.price === "number" ? item.price : 0;
+    lines.push(`- ${name} — ${qty} шт × ${formatRub(price)}`);
+  }
+  lines.push("");
+  lines.push(`Доставка: ${deliveryMethod || "-"}`);
+  lines.push(`Адрес: ${address || "-"}`);
+  lines.push(`Оплата: ${paymentMethod || "-"}`);
+  lines.push(`Доставка (стоимость): ${formatRub(deliveryPrice)}`);
+  lines.push(`Итого: ${formatRub(totalPrice)}`);
+  return lines.join("\n");
+};
+
+const maybeSendOrderEmails = async ({ customerEmail, orderNumber, totalPrice, deliveryPrice, deliveryMethod, paymentMethod, address, items }) => {
+  try {
+    const integrations = await getIntegrationSettings();
+    if (!canSendMail(integrations)) {
+      return;
+    }
+    const adminEmail = integrations.mail.notifyToEmail || integrations.mail.fromEmail;
+    const subject = `Новый заказ №${orderNumber}`;
+    const text = buildOrderEmailText({ orderNumber, totalPrice, deliveryPrice, deliveryMethod, paymentMethod, address, items });
+
+    if (adminEmail) {
+      await sendMailWithSmtp(integrations, { to: adminEmail, subject, text });
+    }
+    if (customerEmail) {
+      await sendMailWithSmtp(integrations, {
+        to: customerEmail,
+        subject: `Подтверждение заказа №${orderNumber}`,
+        text,
+      });
+    }
+  } catch {
+    return;
+  }
+};
+
+const maskIntegrationSettingsForAdmin = (settings) => ({
+  ...settings,
+  sms: {
+    ...settings.sms,
+    smscPassword: "",
+    hasSmscPassword: Boolean(settings.sms.smscPassword),
+  },
+  delivery: {
+    ...settings.delivery,
+    cdekClientSecret: "",
+    yandexApiKey: "",
+    ozonApiKey: "",
+    hasCdekClientSecret: Boolean(settings.delivery.cdekClientSecret),
+    hasYandexApiKey: Boolean(settings.delivery.yandexApiKey),
+    hasOzonApiKey: Boolean(settings.delivery.ozonApiKey),
+  },
+  payment: {
+    ...settings.payment,
+    ozonPaymentKey: "",
+    hasOzonPaymentKey: Boolean(settings.payment.ozonPaymentKey),
+  },
+  mail: {
+    ...settings.mail,
+    smtpPassword: "",
+    hasSmtpPassword: Boolean(settings.mail.smtpPassword),
+  },
+});
+
+const getIntegrationSettings = async () => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'integration_settings' LIMIT 1`);
+  const raw = rows[0]?.value ?? buildDefaultIntegrationSettings();
+  return normalizeIntegrationSettings(raw);
+};
+
+const sendSmsWithSmsc = async ({ login, password, sender, phone, code }) => {
+  const params = new URLSearchParams({
+    login,
+    psw: password,
+    phones: phone,
+    mes: `Код подтверждения: ${code}`,
+    fmt: "3",
+    charset: "utf-8",
+  });
+  if (sender) {
+    params.set("sender", sender);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(`https://smsc.ru/sys/send.php?${params.toString()}`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || !payload || payload.error) {
+      throw new Error(payload?.error ? `smsc_error_${payload.error}` : "smsc_request_failed");
+    }
+    return payload;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const normalizeClientMessages = (rawValue) => {
+  const defaults = buildDefaultClientMessages();
+  const parsed = clientMessagesSchema.safeParse(rawValue);
+  if (!parsed.success) {
+    return defaults;
+  }
+  return {
+    authNotice:
+      typeof parsed.data.authNotice === "string" && parsed.data.authNotice.trim().length > 0
+        ? parsed.data.authNotice.trim()
+        : defaults.authNotice,
+    checkoutNotice:
+      typeof parsed.data.checkoutNotice === "string" && parsed.data.checkoutNotice.trim().length > 0
+        ? parsed.data.checkoutNotice.trim()
+        : defaults.checkoutNotice,
+  };
+};
+
+const dedupeIds = (input) => {
+  if (!Array.isArray(input)) return [];
+  return [...new Set(input.filter((item) => typeof item === "string"))];
+};
+
+const parseOptionalTimestamp = (value) => {
+  if (value === null || value === undefined) {
+    return { valid: true, value: null };
+  }
+  if (typeof value !== "string") {
+    return { valid: false, value: null };
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { valid: true, value: null };
+  }
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value: parsed.toISOString() };
+};
+
+const buildDefaultHomeLayout = () => ({
+  sections: [
+    { key: "hero", enabled: true },
+    { key: "trust", enabled: true },
+    { key: "categories", enabled: true },
+    { key: "gift_sets", enabled: true, title: "Подарочные наборы", viewAllLink: "/catalog?category=gift-sets", limit: 12 },
+    { key: "promo_banners", enabled: true },
+    { key: "premium", enabled: true, title: "Премиум коллекция", viewAllLink: "/catalog?category=premium-sets", badge: "Эксклюзив", limit: 12 },
+    { key: "truffles", enabled: true, title: "Трюфели", viewAllLink: "/catalog?category=truffles", limit: 12 },
+    { key: "discounts", enabled: true, title: "Товары со скидкой", limit: 5 },
+    { key: "popular", enabled: true, title: "Популярные товары", viewAllLink: "/catalog", limit: 8 },
+    { key: "articles", enabled: true },
+  ],
+  featuredCategoryIds: [],
+  seo: {
+    title: "Главная",
+    description:
+      "Премиальные подарочные наборы сладостей, трюфели и шоколад. Доставка по России. Лучшие подарки для любого повода.",
+    keywords: "",
+  },
+  hero: {
+    topBadge: "🎁 Новая коллекция",
+    headline: "Премиальные подарочные наборы",
+    highlight: "подарочные наборы",
+    description:
+      "Изысканные азиатские сладости в элегантной упаковке. Идеальный подарок для ваших близких.",
+    primaryCtaText: "Выбрать подарок",
+    primaryCtaLink: "/catalog?category=gift-sets",
+    secondaryCtaText: "Смотреть каталог",
+    secondaryCtaLink: "/catalog",
+    feature1: "Бесплатная доставка",
+    feature2: "Гарантия качества",
+  },
+  trust: [
+    { icon: "truck", title: "Быстрая доставка", description: "По всей России от 1 дня" },
+    { icon: "shield", title: "Гарантия качества", description: "Оригинальная продукция" },
+    { icon: "rotate", title: "Контроль качества", description: "14 дней на возврат" },
+    { icon: "headphones", title: "Поддержка 24/7", description: "Всегда на связи" },
+  ],
+});
+
+const normalizeHomeLayout = (rawValue) => {
+  const defaults = buildDefaultHomeLayout();
+  const parsed = homeLayoutSchema.safeParse(rawValue);
+  if (!parsed.success) {
+    return defaults;
+  }
+  const overrides = new Map(parsed.data.sections.map((section) => [section.key, section]));
+  return {
+    sections: defaults.sections.map((defaultSection) => {
+      const override = overrides.get(defaultSection.key);
+      if (!override) {
+        return defaultSection;
+      }
+      return {
+        ...defaultSection,
+        enabled: override.enabled,
+        ...(typeof override.title === "string" ? { title: override.title } : {}),
+        ...(typeof override.viewAllLink === "string" ? { viewAllLink: override.viewAllLink } : {}),
+        ...(typeof override.badge === "string" ? { badge: override.badge } : {}),
+        ...(Array.isArray(override.productIds) ? { productIds: dedupeIds(override.productIds) } : {}),
+        ...(typeof override.limit === "number" ? { limit: override.limit } : {}),
+      };
+    }),
+    featuredCategoryIds: dedupeIds(parsed.data.featuredCategoryIds ?? defaults.featuredCategoryIds),
+    seo: {
+      ...defaults.seo,
+      ...(parsed.data.seo ?? {}),
+    },
+    hero: {
+      ...defaults.hero,
+      ...(parsed.data.hero ?? {}),
+    },
+    trust: Array.isArray(parsed.data.trust) && parsed.data.trust.length > 0 ? parsed.data.trust : defaults.trust,
+  };
+};
+
+const buildHomeLayoutPreset = (preset) => {
+  const base = buildDefaultHomeLayout();
+  const sectionByKey = new Map(base.sections.map((section) => [section.key, { ...section }]));
+  if (preset === "holiday") {
+    const holiday = {
+      ...base,
+      hero: {
+        ...base.hero,
+        topBadge: "🎉 Праздничная коллекция",
+        headline: "Подарки для особенных моментов",
+        highlight: "особенных моментов",
+        description: "Премиальные наборы и сладости для праздников, корпоративов и тёплых встреч.",
+      },
+      seo: {
+        ...base.seo,
+        title: "Праздничная витрина",
+        description: "Праздничные подарочные наборы и премиальные сладости с доставкой по России.",
+      },
+      sections: [
+        sectionByKey.get("hero"),
+        sectionByKey.get("trust"),
+        sectionByKey.get("categories"),
+        sectionByKey.get("gift_sets"),
+        sectionByKey.get("premium"),
+        sectionByKey.get("promo_banners"),
+        sectionByKey.get("truffles"),
+        sectionByKey.get("popular"),
+        sectionByKey.get("discounts"),
+        sectionByKey.get("articles"),
+      ].filter(Boolean),
+    };
+    return normalizeHomeLayout(holiday);
+  }
+  if (preset === "sale") {
+    const sale = {
+      ...base,
+      hero: {
+        ...base.hero,
+        topBadge: "🔥 Сезон скидок",
+        headline: "Лучшие скидки недели",
+        highlight: "скидки недели",
+        description: "Горячие предложения и акционные подборки, пока товары в наличии.",
+      },
+      seo: {
+        ...base.seo,
+        title: "Витрина распродажи",
+        description: "Скидки, акции и специальные предложения на сладости и подарочные наборы.",
+      },
+      sections: [
+        sectionByKey.get("hero"),
+        sectionByKey.get("discounts"),
+        sectionByKey.get("promo_banners"),
+        sectionByKey.get("popular"),
+        sectionByKey.get("categories"),
+        sectionByKey.get("gift_sets"),
+        sectionByKey.get("truffles"),
+        sectionByKey.get("premium"),
+        sectionByKey.get("trust"),
+        sectionByKey.get("articles"),
+      ].filter(Boolean),
+    };
+    return normalizeHomeLayout(sale);
+  }
+  return normalizeHomeLayout(base);
+};
+
+const applyHomeLayoutPreset = (currentLayout, presetLayout, applyOptions) => {
+  const current = normalizeHomeLayout(currentLayout);
+  const preset = normalizeHomeLayout(presetLayout);
+  const options = {
+    sections: true,
+    featuredCategoryIds: true,
+    seo: true,
+    hero: true,
+    trust: true,
+    ...(applyOptions ?? {}),
+  };
+  return normalizeHomeLayout({
+    sections: options.sections ? preset.sections : current.sections,
+    featuredCategoryIds: options.featuredCategoryIds ? preset.featuredCategoryIds : current.featuredCategoryIds,
+    seo: options.seo ? preset.seo : current.seo,
+    hero: options.hero ? preset.hero : current.hero,
+    trust: options.trust ? preset.trust : current.trust,
+  });
+};
+
+const stringifyStable = (value) => JSON.stringify(value ?? null);
+
+const getChangedObjectKeys = (currentValue, nextValue) => {
+  const current = currentValue && typeof currentValue === "object" ? currentValue : {};
+  const next = nextValue && typeof nextValue === "object" ? nextValue : {};
+  const keys = new Set([...Object.keys(current), ...Object.keys(next)]);
+  return [...keys].filter((key) => stringifyStable(current[key]) !== stringifyStable(next[key]));
+};
+
+const getSectionsDiffDetails = (currentSections, nextSections) => {
+  const current = Array.isArray(currentSections) ? currentSections : [];
+  const next = Array.isArray(nextSections) ? nextSections : [];
+  const currentOrder = current.map((section) => section.key);
+  const nextOrder = next.map((section) => section.key);
+  const currentByKey = new Map(current.map((section) => [section.key, section]));
+  const nextByKey = new Map(next.map((section) => [section.key, section]));
+  const keys = new Set([...currentOrder, ...nextOrder]);
+  const changedKeys = [...keys].filter(
+    (key) => stringifyStable(currentByKey.get(key)) !== stringifyStable(nextByKey.get(key)),
+  );
+  return {
+    orderChanged: stringifyStable(currentOrder) !== stringifyStable(nextOrder),
+    changedKeys,
+  };
+};
+
+const getHomeLayoutPreviewDiff = (currentLayout, nextLayout) => {
+  const current = normalizeHomeLayout(currentLayout);
+  const next = normalizeHomeLayout(nextLayout);
+  const changed = {
+    sections: stringifyStable(current.sections) !== stringifyStable(next.sections),
+    featuredCategoryIds:
+      stringifyStable(current.featuredCategoryIds) !== stringifyStable(next.featuredCategoryIds),
+    seo: stringifyStable(current.seo) !== stringifyStable(next.seo),
+    hero: stringifyStable(current.hero) !== stringifyStable(next.hero),
+    trust: stringifyStable(current.trust) !== stringifyStable(next.trust),
+  };
+  const details = {
+    sections: getSectionsDiffDetails(current.sections, next.sections),
+    featuredCategoryIds: {
+      added: next.featuredCategoryIds.filter((id) => !current.featuredCategoryIds.includes(id)),
+      removed: current.featuredCategoryIds.filter((id) => !next.featuredCategoryIds.includes(id)),
+    },
+    seo: {
+      changedKeys: getChangedObjectKeys(current.seo, next.seo),
+    },
+    hero: {
+      changedKeys: getChangedObjectKeys(current.hero, next.hero),
+    },
+    trust: {
+      changedIndices: Array.from(
+        { length: Math.max(current.trust.length, next.trust.length) },
+        (_, index) => index,
+      ).filter((index) => stringifyStable(current.trust[index]) !== stringifyStable(next.trust[index])),
+      beforeCount: current.trust.length,
+      afterCount: next.trust.length,
+    },
+  };
+  return {
+    changed,
+    changedCount: Object.values(changed).filter(Boolean).length,
+    details,
+  };
+};
+
 const query = (text, params) => pool.query(text, params);
+
+const withTransaction = async (handler) => {
+  const client = await pool.connect();
+  const queryTx = (text, params) => client.query(text, params);
+  try {
+    await client.query("BEGIN");
+    const result = await handler(queryTx);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+const ensureConstraint = async (sql) => {
+  await query(`DO $$ BEGIN ${sql} EXCEPTION WHEN duplicate_object THEN END $$;`);
+};
+
+const countDuplicates = async (sql, params) => {
+  const { rows } = await query(sql, params);
+  return Number.parseInt(rows[0]?.count ?? "0", 10);
+};
+
+const createUniqueIndexIfSafe = async (countSql, createSql, params) => {
+  const duplicates = await countDuplicates(countSql, params);
+  if (duplicates === 0) {
+    await query(createSql);
+  }
+};
+
+const validateConstraintIfSafe = async (invalidCountSql, validateSql, params) => {
+  const invalidCount = await countDuplicates(invalidCountSql, params);
+  if (invalidCount === 0) {
+    await query(validateSql);
+  }
+};
+
+const dropColumnIfSafe = async (table, column, canDropSql, params) => {
+  const { rows } = await query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_name = $1 AND column_name = $2
+      LIMIT 1
+    `,
+    [table, column],
+  );
+  if (rows.length === 0) {
+    return;
+  }
+  const blockers = await countDuplicates(canDropSql, params);
+  if (blockers === 0) {
+    await query(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  }
+};
 
 const ensureSchema = async () => {
   await query('CREATE EXTENSION IF NOT EXISTS "pgcrypto"');
@@ -267,6 +1289,9 @@ const ensureSchema = async () => {
       expires_at TIMESTAMP WITH TIME ZONE NOT NULL
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS auth_sessions_token_hash_idx ON auth_sessions(token_hash)`);
+  await query(`CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx ON auth_sessions(user_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS auth_sessions_expires_at_idx ON auth_sessions(expires_at)`);
   await query(`
     CREATE TABLE IF NOT EXISTS otp_requests (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -277,6 +1302,20 @@ const ensureSchema = async () => {
       expires_at TIMESTAMP WITH TIME ZONE NOT NULL
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS otp_requests_phone_idx ON otp_requests(phone)`);
+  await query(`CREATE INDEX IF NOT EXISTS otp_requests_expires_at_idx ON otp_requests(expires_at)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS email_otp_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+      expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS email_otp_requests_email_idx ON email_otp_requests(email)`);
+  await query(`CREATE INDEX IF NOT EXISTS email_otp_requests_expires_at_idx ON email_otp_requests(expires_at)`);
   await query(`
     CREATE TABLE IF NOT EXISTS categories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -288,6 +1327,10 @@ const ensureSchema = async () => {
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS image TEXT`);
+  await query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS emoji TEXT`);
+  await query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0`);
+  await query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()`);
   await query(`
     CREATE TABLE IF NOT EXISTS products (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -310,10 +1353,37 @@ const ensureSchema = async () => {
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS slug TEXT`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS price NUMERIC`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS old_price NUMERIC`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS images TEXT[]`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id UUID`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS product_type TEXT`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS in_stock BOOLEAN DEFAULT true`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS stock_count INTEGER`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS rating NUMERIC DEFAULT 0`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS reviews_count INTEGER DEFAULT 0`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT false`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_new BOOLEAN DEFAULT false`);
+  await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0`);
+  await query(
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()`,
+  );
+  await query(
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()`,
+  );
+  await ensureConstraint(
+    "ALTER TABLE products ADD CONSTRAINT products_category_id_fkey FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL;",
+  );
+  await query(`ALTER TABLE products ALTER COLUMN slug DROP NOT NULL`);
   await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS meta_title TEXT`);
   await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS meta_description TEXT`);
   await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS meta_keywords TEXT`);
   await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS seo_text TEXT`);
+  await query(`CREATE INDEX IF NOT EXISTS products_slug_idx ON products(slug)`);
+  await query(`CREATE INDEX IF NOT EXISTS products_category_id_idx ON products(category_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS products_sort_created_idx ON products(sort_order, created_at DESC)`);
   await query(`
     CREATE TABLE IF NOT EXISTS product_categories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -322,6 +1392,8 @@ const ensureSchema = async () => {
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS product_categories_product_id_idx ON product_categories(product_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS product_categories_category_id_idx ON product_categories(category_id)`);
   await query(`
     CREATE TABLE IF NOT EXISTS orders (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -336,17 +1408,62 @@ const ensureSchema = async () => {
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS orders_user_id_created_at_idx ON orders(user_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS orders_created_at_idx ON orders(created_at DESC)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS user_addresses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      recipient_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      city TEXT NOT NULL,
+      street TEXT NOT NULL,
+      building TEXT NOT NULL,
+      apartment TEXT,
+      entrance TEXT,
+      floor TEXT,
+      comment TEXT,
+      is_default BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+      updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS user_addresses_user_id_idx ON user_addresses(user_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS user_addresses_user_default_idx ON user_addresses(user_id, is_default DESC)`);
   await query(`
     CREATE TABLE IF NOT EXISTS order_items (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      product_id TEXT NOT NULL,
+      product_id TEXT,
+      product_id_uuid UUID,
       product_name TEXT NOT NULL,
       product_image TEXT,
       price NUMERIC NOT NULL,
       quantity INTEGER NOT NULL DEFAULT 1
     )
   `);
+  await query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS product_id_uuid UUID`);
+  const { rows: orderItemsLegacyColumn } = await query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_name = 'order_items' AND column_name = 'product_id'
+      LIMIT 1
+    `,
+  );
+  if (orderItemsLegacyColumn.length > 0) {
+    await query(
+      `
+        UPDATE order_items
+        SET product_id_uuid = NULLIF(product_id, '')::uuid
+        WHERE product_id_uuid IS NULL
+          AND product_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      `,
+    );
+  }
+  await query(`CREATE INDEX IF NOT EXISTS order_items_order_id_idx ON order_items(order_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS order_items_product_id_uuid_idx ON order_items(product_id_uuid)`);
   await query(`
     CREATE TABLE IF NOT EXISTS reviews (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -360,6 +1477,9 @@ const ensureSchema = async () => {
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS reviews_product_status_idx ON reviews(product_id, status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS reviews_user_id_idx ON reviews(user_id, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS reviews_order_id_idx ON reviews(order_id)`);
   await query(`
     CREATE TABLE IF NOT EXISTS banners (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -372,21 +1492,32 @@ const ensureSchema = async () => {
       variant TEXT DEFAULT 'default',
       position TEXT,
       is_active BOOLEAN DEFAULT true,
+      starts_at TIMESTAMP WITH TIME ZONE,
+      ends_at TIMESTAMP WITH TIME ZONE,
       sort_order INTEGER DEFAULT 0,
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`ALTER TABLE banners ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP WITH TIME ZONE`);
+  await query(`ALTER TABLE banners ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP WITH TIME ZONE`);
+  await query(`CREATE INDEX IF NOT EXISTS banners_active_position_idx ON banners(is_active, position)`);
+  await query(`CREATE INDEX IF NOT EXISTS banners_sort_idx ON banners(sort_order, created_at DESC)`);
   await query(`
     CREATE TABLE IF NOT EXISTS hero_products (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       badge TEXT,
       is_active BOOLEAN DEFAULT true,
+      starts_at TIMESTAMP WITH TIME ZONE,
+      ends_at TIMESTAMP WITH TIME ZONE,
       sort_order INTEGER DEFAULT 0,
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`ALTER TABLE hero_products ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP WITH TIME ZONE`);
+  await query(`ALTER TABLE hero_products ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP WITH TIME ZONE`);
+  await query(`CREATE INDEX IF NOT EXISTS hero_products_active_sort_idx ON hero_products(is_active, sort_order, created_at DESC)`);
   await query(`
     CREATE TABLE IF NOT EXISTS articles (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -404,6 +1535,8 @@ const ensureSchema = async () => {
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS articles_status_created_idx ON articles(status, created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS articles_slug_idx ON articles(slug)`);
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -414,6 +1547,106 @@ const ensureSchema = async () => {
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
     )
   `);
+  await query(`CREATE INDEX IF NOT EXISTS pages_slug_idx ON pages(slug)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+    )
+  `);
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('home_layout', $1::jsonb) ON CONFLICT (key) DO NOTHING`,
+    [JSON.stringify(buildDefaultHomeLayout())],
+  );
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('client_messages', $1::jsonb) ON CONFLICT (key) DO NOTHING`,
+    [JSON.stringify(buildDefaultClientMessages())],
+  );
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('integration_settings', $1::jsonb) ON CONFLICT (key) DO NOTHING`,
+    [JSON.stringify(buildDefaultIntegrationSettings())],
+  );
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('theme_settings', $1::jsonb) ON CONFLICT (key) DO NOTHING`,
+    [JSON.stringify(buildDefaultThemeSettings())],
+  );
+
+  await ensureConstraint(
+    `ALTER TABLE reviews ADD CONSTRAINT reviews_rating_range_check CHECK (rating >= 1 AND rating <= 5) NOT VALID;`,
+  );
+  await ensureConstraint(
+    `ALTER TABLE reviews ADD CONSTRAINT reviews_status_check CHECK (status IN ('pending','published','rejected')) NOT VALID;`,
+  );
+  await ensureConstraint(
+    `ALTER TABLE articles ADD CONSTRAINT articles_status_check CHECK (status IN ('draft','published')) NOT VALID;`,
+  );
+  await ensureConstraint(
+    `ALTER TABLE order_items ADD CONSTRAINT order_items_product_id_uuid_fkey FOREIGN KEY (product_id_uuid) REFERENCES products(id) ON DELETE SET NULL NOT VALID;`,
+  );
+
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (SELECT slug FROM categories GROUP BY slug HAVING COUNT(*) > 1) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS categories_slug_unique_idx ON categories(slug)`,
+  );
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (SELECT slug FROM pages GROUP BY slug HAVING COUNT(*) > 1) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS pages_slug_unique_idx ON pages(slug)`,
+  );
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (SELECT slug FROM articles GROUP BY slug HAVING COUNT(*) > 1) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS articles_slug_unique_idx ON articles(slug)`,
+  );
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (SELECT slug FROM products WHERE slug IS NOT NULL GROUP BY slug HAVING COUNT(*) > 1) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS products_slug_unique_idx ON products(slug) WHERE slug IS NOT NULL`,
+  );
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (
+      SELECT product_id, category_id
+      FROM product_categories
+      GROUP BY product_id, category_id
+      HAVING COUNT(*) > 1
+    ) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS product_categories_unique_idx ON product_categories(product_id, category_id)`,
+  );
+  await createUniqueIndexIfSafe(
+    `SELECT COUNT(*) AS count FROM (
+      SELECT user_id, product_id, order_id
+      FROM reviews
+      WHERE order_id IS NOT NULL
+      GROUP BY user_id, product_id, order_id
+      HAVING COUNT(*) > 1
+    ) t`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS reviews_unique_user_product_order_idx ON reviews(user_id, product_id, order_id) WHERE order_id IS NOT NULL`,
+  );
+
+  await validateConstraintIfSafe(
+    `SELECT COUNT(*) AS count FROM reviews WHERE rating < 1 OR rating > 5`,
+    `ALTER TABLE reviews VALIDATE CONSTRAINT reviews_rating_range_check`,
+  );
+  await validateConstraintIfSafe(
+    `SELECT COUNT(*) AS count FROM reviews WHERE status NOT IN ('pending','published','rejected')`,
+    `ALTER TABLE reviews VALIDATE CONSTRAINT reviews_status_check`,
+  );
+  await validateConstraintIfSafe(
+    `SELECT COUNT(*) AS count FROM articles WHERE status NOT IN ('draft','published')`,
+    `ALTER TABLE articles VALIDATE CONSTRAINT articles_status_check`,
+  );
+  await validateConstraintIfSafe(
+    `
+      SELECT COUNT(*) AS count
+      FROM order_items oi
+      LEFT JOIN products p ON p.id = oi.product_id_uuid
+      WHERE oi.product_id_uuid IS NOT NULL AND p.id IS NULL
+    `,
+    `ALTER TABLE order_items VALIDATE CONSTRAINT order_items_product_id_uuid_fkey`,
+  );
+  await dropColumnIfSafe(
+    "order_items",
+    "product_id",
+    `SELECT COUNT(*) AS count FROM order_items WHERE product_id_uuid IS NULL`,
+  );
 };
 
 const ensureUserRole = async (userId, role) => {
@@ -475,17 +1708,17 @@ const createSession = async (userId) => {
     `,
     [tokenHash, userId, expiresAt],
   );
-  return token;
+  return { token, expiresAt: expiresAt.toISOString() };
 };
 
-const loadUserFromToken = async (token) => {
+const loadSessionFromToken = async (token) => {
   if (!token) {
     return null;
   }
   const tokenHash = hashToken(token);
   const { rows } = await query(
     `
-      SELECT u.id, u.email, u.phone
+      SELECT u.id, u.email, u.phone, s.created_at AS session_created_at, s.expires_at AS session_expires_at
       FROM auth_sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = $1 AND s.expires_at > now()
@@ -493,7 +1726,17 @@ const loadUserFromToken = async (token) => {
     `,
     [tokenHash],
   );
-  return rows[0] ?? null;
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return {
+    user: { id: row.id, email: row.email, phone: row.phone },
+    session: {
+      createdAt: row.session_created_at ? new Date(row.session_created_at).toISOString() : null,
+      expiresAt: row.session_expires_at ? new Date(row.session_expires_at).toISOString() : null,
+    },
+  };
 };
 
 const loadRoles = async (userId) => {
@@ -519,8 +1762,28 @@ const mapOrder = (row) => ({
 
 const mapOrderItem = (row) => ({
   ...row,
+  product_id: row.product_id_uuid,
   price: toNumber(row.price),
   quantity: toNumber(row.quantity),
+});
+
+const mapRecommendationProduct = (row) => ({
+  ...mapProduct(row),
+  recommendation_source: row.recommendation_source ?? null,
+  recommendation_strength: toNumber(row.recommendation_strength),
+  recommendation_score: toNumber(row.recommendation_score),
+});
+
+const mapProfile = (row) => ({
+  id: row.id,
+  email: row.email ?? null,
+  phone: row.phone ?? null,
+  name: row.name ?? null,
+});
+
+const mapUserAddress = (row) => ({
+  ...row,
+  is_default: Boolean(row.is_default),
 });
 
 const mapCategory = (row) => ({
@@ -560,6 +1823,10 @@ const mapStats = (row) => ({
   totalOrders: toNumber(row.total_orders),
   totalCategories: toNumber(row.total_categories),
   totalRevenue: toNumber(row.total_revenue),
+  products: toNumber(row.total_products),
+  orders: toNumber(row.total_orders),
+  categories: toNumber(row.total_categories),
+  revenue: toNumber(row.total_revenue),
 });
 
 const recalculateProductRating = async (productId) => {
@@ -606,13 +1873,14 @@ app.use(
       next();
       return;
     }
-    const user = await loadUserFromToken(token);
-    if (!user) {
+    const session = await loadSessionFromToken(token);
+    if (!session?.user) {
       next();
       return;
     }
-    req.user = user;
-    req.roles = await loadRoles(user.id);
+    req.user = session.user;
+    req.session = session.session;
+    req.roles = await loadRoles(session.user.id);
     next();
   }),
 );
@@ -632,7 +1900,21 @@ const uploadStorage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage: uploadStorage });
+const allowedUploadExts = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+
+const upload = multer({
+  storage: uploadStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const mime = (file.mimetype || "").toLowerCase();
+    if (!allowedUploadExts.has(ext) || !mime.startsWith("image/")) {
+      cb(new Error("invalid_file_type"));
+      return;
+    }
+    cb(null, true);
+  },
+});
 
 const buildFileUrl = (req, filePath) => {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
@@ -643,6 +1925,7 @@ app.post(
   "/api/uploads/product-image",
   requireAuth,
   requireRole("admin"),
+  rateLimit({ prefix: "uploads", windowMs: 60 * 60 * 1000, max: 200, keyFn: (req) => req.user.id }),
   upload.single("file"),
   (req, res) => {
     if (!req.file) {
@@ -658,6 +1941,7 @@ app.post(
   "/api/uploads/article-cover",
   requireAuth,
   requireRole("admin"),
+  rateLimit({ prefix: "uploads", windowMs: 60 * 60 * 1000, max: 200, keyFn: (req) => req.user.id }),
   upload.single("file"),
   (req, res) => {
     if (!req.file) {
@@ -671,6 +1955,7 @@ app.post(
 
 app.post(
   "/api/auth/login",
+  rateLimit({ prefix: "auth-login", windowMs: 15 * 60 * 1000, max: 20, keyFn: (req) => req.ip }),
   asyncHandler(async (req, res) => {
     const parsed = authLoginSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -685,9 +1970,14 @@ app.post(
       res.status(401).json({ error: "invalid_credentials" });
       return;
     }
-    const token = await createSession(user.id);
+    const session = await createSession(user.id);
     const roles = await loadRoles(user.id);
-    res.json({ token, user: { id: user.id, email: user.email, phone: user.phone }, roles });
+    res.json({
+      token: session.token,
+      user: { id: user.id, email: user.email, phone: user.phone },
+      roles,
+      session: { expiresAt: session.expiresAt },
+    });
   }),
 );
 
@@ -704,6 +1994,13 @@ app.post(
       res.status(400).json({ error: "invalid_phone" });
       return;
     }
+    if (
+      !takeRateLimit(`auth-otp-ip:${req.ip}`, 10 * 60 * 1000, 10) ||
+      !takeRateLimit(`auth-otp-phone:${normalizedPhone}`, 10 * 60 * 1000, 5)
+    ) {
+      res.status(429).json({ error: "rate_limited" });
+      return;
+    }
     const otp = randomInt(0, 1000000).toString().padStart(6, "0");
     const otpHash = hashOtp(otp);
     const expiresAt = new Date(Date.now() + smsOtpTtlMs);
@@ -715,12 +2012,34 @@ app.post(
       `,
       [normalizedPhone, otpHash, expiresAt],
     );
+    try {
+      const integrations = await getIntegrationSettings();
+      if (integrations.sms.provider === "smsc") {
+        if (!integrations.sms.smscLogin || !integrations.sms.smscPassword) {
+          await query(`DELETE FROM otp_requests WHERE id = $1`, [rows[0].id]);
+          res.status(400).json({ error: "sms_credentials_missing" });
+          return;
+        }
+        await sendSmsWithSmsc({
+          login: integrations.sms.smscLogin,
+          password: integrations.sms.smscPassword,
+          sender: integrations.sms.sender,
+          phone: normalizedPhone,
+          code: otp,
+        });
+      }
+    } catch (error) {
+      await query(`DELETE FROM otp_requests WHERE id = $1`, [rows[0].id]);
+      res.status(502).json({ error: "sms_send_failed", details: isProd ? undefined : String(error?.message ?? error) });
+      return;
+    }
     res.json({ requestId: rows[0].id });
   }),
 );
 
 app.post(
   "/api/auth/otp/verify",
+  rateLimit({ prefix: "auth-otp-verify", windowMs: 10 * 60 * 1000, max: 30, keyFn: (req) => req.ip }),
   asyncHandler(async (req, res) => {
     const parsed = authOtpVerifySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -775,9 +2094,120 @@ app.post(
     }
     await ensureProfile(userId, normalizedPhone, null);
     await ensureUserRole(userId, "user");
-    const token = await createSession(userId);
+    const session = await createSession(userId);
     const roles = await loadRoles(userId);
-    res.json({ token, user: { id: userId, phone: normalizedPhone }, roles });
+    res.json({
+      token: session.token,
+      user: { id: userId, phone: normalizedPhone },
+      roles,
+      session: { expiresAt: session.expiresAt },
+    });
+  }),
+);
+
+app.post(
+  "/api/auth/email-otp/request",
+  rateLimit({ prefix: "auth-email-otp-request", windowMs: 10 * 60 * 1000, max: 30, keyFn: (req) => req.ip }),
+  asyncHandler(async (req, res) => {
+    const parsed = authEmailOtpRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const normalizedEmail = parsed.data.email.trim().toLowerCase();
+    if (!takeRateLimit(`auth-email-otp:${normalizedEmail}`, 10 * 60 * 1000, 6)) {
+      res.status(429).json({ error: "rate_limited" });
+      return;
+    }
+    const otp = randomInt(0, 1000000).toString().padStart(6, "0");
+    const otpHash = hashOtp(otp);
+    const expiresAt = new Date(Date.now() + smsOtpTtlMs);
+    const { rows } = await query(
+      `
+        INSERT INTO email_otp_requests (email, otp_hash, expires_at)
+        VALUES ($1, $2, $3)
+        RETURNING id
+      `,
+      [normalizedEmail, otpHash, expiresAt],
+    );
+    try {
+      const integrations = await getIntegrationSettings();
+      await sendMailWithSmtp(integrations, {
+        to: normalizedEmail,
+        subject: "Код для входа",
+        text: `Код подтверждения: ${otp}\n\nЕсли вы не запрашивали код — просто игнорируйте это письмо.`,
+      });
+    } catch (error) {
+      await query(`DELETE FROM email_otp_requests WHERE id = $1`, [rows[0].id]);
+      res.status(502).json({ error: "email_send_failed", details: isProd ? undefined : String(error?.message ?? error) });
+      return;
+    }
+    res.json({ requestId: rows[0].id });
+  }),
+);
+
+app.post(
+  "/api/auth/email-otp/verify",
+  rateLimit({ prefix: "auth-email-otp-verify", windowMs: 10 * 60 * 1000, max: 40, keyFn: (req) => req.ip }),
+  asyncHandler(async (req, res) => {
+    const parsed = authEmailOtpVerifySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const normalizedEmail = parsed.data.email.trim().toLowerCase();
+    const { rows } = await query(
+      `
+        SELECT id, otp_hash, attempts, expires_at
+        FROM email_otp_requests
+        WHERE id = $1 AND email = $2
+        LIMIT 1
+      `,
+      [parsed.data.requestId, normalizedEmail],
+    );
+    const request = rows[0];
+    if (!request) {
+      res.status(404).json({ error: "request_not_found" });
+      return;
+    }
+    if (new Date(request.expires_at).getTime() < Date.now()) {
+      res.status(400).json({ error: "otp_expired" });
+      return;
+    }
+    if (request.attempts >= smsMaxAttempts) {
+      res.status(429).json({ error: "otp_attempts_exceeded" });
+      return;
+    }
+    const codeHash = hashOtp(parsed.data.code.trim());
+    if (!safeEqual(codeHash, request.otp_hash)) {
+      await query(`UPDATE email_otp_requests SET attempts = attempts + 1 WHERE id = $1`, [request.id]);
+      res.status(400).json({ error: "otp_invalid" });
+      return;
+    }
+    await query(`DELETE FROM email_otp_requests WHERE id = $1`, [request.id]);
+    const existingUser = await query(`SELECT id, email, phone FROM users WHERE email = $1`, [normalizedEmail]);
+    let userId = existingUser.rows[0]?.id;
+    if (!userId) {
+      const inserted = await query(
+        `
+          INSERT INTO users (email)
+          VALUES ($1)
+          RETURNING id
+        `,
+        [normalizedEmail],
+      );
+      userId = inserted.rows[0].id;
+    }
+    await ensureProfile(userId, existingUser.rows[0]?.phone ?? null, null);
+    await ensureUserRole(userId, "user");
+    const session = await createSession(userId);
+    const roles = await loadRoles(userId);
+    res.json({
+      token: session.token,
+      user: { id: userId, email: normalizedEmail },
+      roles,
+      session: { expiresAt: session.expiresAt },
+    });
   }),
 );
 
@@ -785,23 +2215,172 @@ app.get(
   "/api/auth/me",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const roles = await loadRoles(req.user.id);
-    res.json({ user: req.user, roles });
+    const roles = req.roles ?? (await loadRoles(req.user.id));
+    res.json({ user: req.user, roles, session: req.session ?? null });
+  }),
+);
+
+app.post(
+  "/api/auth/logout",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const token = parseBearerToken(req);
+    if (!token) {
+      res.status(400).json({ error: "invalid_token" });
+      return;
+    }
+    const tokenHash = hashToken(token);
+    await query(`DELETE FROM auth_sessions WHERE token_hash = $1 AND user_id = $2`, [
+      tokenHash,
+      req.user.id,
+    ]);
+    res.status(204).end();
+  }),
+);
+
+app.get(
+  "/api/home-layout",
+  asyncHandler(async (_req, res) => {
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'home_layout' LIMIT 1`);
+    const rawValue = rows[0]?.value ?? buildDefaultHomeLayout();
+    res.json(normalizeHomeLayout(rawValue));
+  }),
+);
+
+app.get(
+  "/api/client-messages",
+  asyncHandler(async (_req, res) => {
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'client_messages' LIMIT 1`);
+    const rawValue = rows[0]?.value ?? buildDefaultClientMessages();
+    res.json(normalizeClientMessages(rawValue));
+  }),
+);
+
+app.get(
+  "/api/theme",
+  asyncHandler(async (_req, res) => {
+    const theme = await getThemeSettings();
+    res.json(theme);
   }),
 );
 
 app.get(
   "/api/products",
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
+    const hasCatalogParams = [
+      "category",
+      "search",
+      "tag",
+      "minPrice",
+      "maxPrice",
+      "sort",
+      "page",
+      "pageSize",
+      "inStock",
+    ].some((key) => req.query[key] !== undefined);
+
+    if (!hasCatalogParams) {
+      const { rows } = await query(
+        `
+          SELECT p.*, c.slug AS category_slug
+          FROM products p
+          LEFT JOIN categories c ON c.id = p.category_id
+          ORDER BY p.sort_order ASC, p.created_at DESC
+        `,
+      );
+      res.json(rows.map(mapProduct));
+      return;
+    }
+
+    const values = [];
+    const filters = [];
+
+    if (req.query.category) {
+      values.push(String(req.query.category));
+      filters.push(`c.slug = $${values.length}`);
+    }
+
+    if (req.query.search) {
+      values.push(`%${String(req.query.search).trim()}%`);
+      filters.push(`(p.name ILIKE $${values.length} OR COALESCE(p.description, '') ILIKE $${values.length})`);
+    }
+
+    if (req.query.tag === "sale") {
+      filters.push(`p.old_price IS NOT NULL AND p.old_price > p.price`);
+    } else if (req.query.tag === "new") {
+      filters.push(`p.is_new = true`);
+    } else if (req.query.tag === "hits") {
+      filters.push(`p.reviews_count > 0`);
+    }
+
+    if (req.query.inStock === "true") {
+      filters.push(`p.in_stock = true`);
+    }
+
+    const minPrice = Number.parseFloat(String(req.query.minPrice ?? ""));
+    if (Number.isFinite(minPrice)) {
+      values.push(minPrice);
+      filters.push(`p.price >= $${values.length}`);
+    }
+
+    const maxPrice = Number.parseFloat(String(req.query.maxPrice ?? ""));
+    if (Number.isFinite(maxPrice)) {
+      values.push(maxPrice);
+      filters.push(`p.price <= $${values.length}`);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const sort = String(req.query.sort ?? "popular");
+    let orderBy = "p.reviews_count DESC, p.rating DESC, p.created_at DESC";
+    if (sort === "price-asc") {
+      orderBy = "p.price ASC, p.created_at DESC";
+    } else if (sort === "price-desc") {
+      orderBy = "p.price DESC, p.created_at DESC";
+    } else if (sort === "rating") {
+      orderBy = "p.rating DESC, p.reviews_count DESC, p.created_at DESC";
+    } else if (sort === "newest") {
+      orderBy = "p.is_new DESC, p.created_at DESC";
+    }
+
+    const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const pageSizeRaw = Number.parseInt(String(req.query.pageSize ?? "24"), 10) || 24;
+    const pageSize = Math.max(1, Math.min(60, pageSizeRaw));
+    const offset = (page - 1) * pageSize;
+
+    const countResult = await query(
+      `
+        SELECT COUNT(*)::int AS total
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        ${where}
+      `,
+      values,
+    );
+    const total = countResult.rows[0]?.total ?? 0;
+
+    const listValues = [...values, pageSize, offset];
+    const limitParam = `$${listValues.length - 1}`;
+    const offsetParam = `$${listValues.length}`;
     const { rows } = await query(
       `
         SELECT p.*, c.slug AS category_slug
         FROM products p
         LEFT JOIN categories c ON c.id = p.category_id
-        ORDER BY p.sort_order ASC, p.created_at DESC
+        ${where}
+        ORDER BY ${orderBy}
+        LIMIT ${limitParam} OFFSET ${offsetParam}
       `,
+      listValues,
     );
-    res.json(rows.map(mapProduct));
+
+    res.json({
+      items: rows.map(mapProduct),
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    });
   }),
 );
 
@@ -940,6 +2519,8 @@ app.get(
     if (req.query.is_active === "true") {
       values.push(true);
       filters.push(`is_active = $${values.length}`);
+      filters.push(`(starts_at IS NULL OR starts_at <= now())`);
+      filters.push(`(ends_at IS NULL OR ends_at >= now())`);
     }
     if (req.query.position) {
       values.push(req.query.position);
@@ -962,12 +2543,15 @@ app.get(
 app.get(
   "/api/hero-products",
   asyncHandler(async (req, res) => {
+    const filters = [];
     const values = [];
-    let where = "";
     if (req.query.is_active === "true") {
       values.push(true);
-      where = `WHERE hp.is_active = $1`;
+      filters.push(`hp.is_active = $${values.length}`);
+      filters.push(`(hp.starts_at IS NULL OR hp.starts_at <= now())`);
+      filters.push(`(hp.ends_at IS NULL OR hp.ends_at >= now())`);
     }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
     const { rows } = await query(
       `
         SELECT
@@ -975,6 +2559,8 @@ app.get(
           hp.product_id AS hero_product_id,
           hp.badge AS hero_badge,
           hp.is_active AS hero_is_active,
+          hp.starts_at AS hero_starts_at,
+          hp.ends_at AS hero_ends_at,
           hp.sort_order AS hero_sort_order,
           hp.created_at AS hero_created_at,
           p.*,
@@ -1013,6 +2599,8 @@ app.get(
           product_id: row.hero_product_id,
           badge: row.hero_badge,
           is_active: row.hero_is_active,
+          starts_at: row.hero_starts_at,
+          ends_at: row.hero_ends_at,
           sort_order: row.hero_sort_order,
           created_at: row.hero_created_at,
           product: mapProduct(productRow),
@@ -1026,11 +2614,13 @@ app.get(
   "/api/articles",
   asyncHandler(async (req, res) => {
     const values = [];
-    let where = "";
-    if (req.query.status) {
-      values.push(req.query.status);
-      where = `WHERE status = $1`;
+    const status = req.query.status;
+    if (status && status !== "published") {
+      res.status(400).json({ error: "invalid_status" });
+      return;
     }
+    values.push("published");
+    const where = `WHERE status = $1`;
     const { rows } = await query(
       `
         SELECT *
@@ -1047,9 +2637,10 @@ app.get(
 app.get(
   "/api/articles/by-slug/:slug",
   asyncHandler(async (req, res) => {
-    const { rows } = await query(`SELECT * FROM articles WHERE slug = $1 LIMIT 1`, [
-      req.params.slug,
-    ]);
+    const { rows } = await query(
+      `SELECT * FROM articles WHERE slug = $1 AND status = 'published' LIMIT 1`,
+      [req.params.slug],
+    );
     const article = rows[0];
     if (!article) {
       res.status(404).json({ error: "not_found" });
@@ -1096,10 +2687,15 @@ app.get(
 app.get(
   "/api/reviews/eligible-orders",
   requireAuth,
+  rateLimit({ prefix: "reviews-eligible", windowMs: 5 * 60 * 1000, max: 60, keyFn: (req) => req.user.id }),
   asyncHandler(async (req, res) => {
     const productId = req.query.productId;
     if (!productId) {
       res.json([]);
+      return;
+    }
+    if (typeof productId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productId)) {
+      res.status(400).json({ error: "invalid_product" });
       return;
     }
     const { rows } = await query(
@@ -1107,7 +2703,8 @@ app.get(
         SELECT DISTINCT o.id, o.order_number
         FROM orders o
         JOIN order_items oi ON oi.order_id = o.id
-        WHERE o.user_id = $1 AND oi.product_id = $2
+        WHERE o.user_id = $1
+          AND oi.product_id_uuid = $2::uuid
         ORDER BY o.created_at DESC
       `,
       [req.user.id, productId],
@@ -1119,10 +2716,42 @@ app.get(
 app.post(
   "/api/reviews",
   requireAuth,
+  rateLimit({ prefix: "reviews-create", windowMs: 60 * 60 * 1000, max: 30, keyFn: (req) => req.user.id }),
   asyncHandler(async (req, res) => {
-    const { product_id, order_id, rating, text, author_name } = req.body || {};
-    if (!product_id || !rating || !text) {
-      res.status(400).json({ error: "invalid_payload" });
+    const parsed = reviewCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+
+    const eligible = await query(
+      `
+        SELECT 1
+        FROM orders o
+        JOIN order_items oi ON oi.order_id = o.id
+        WHERE o.id = $1
+          AND o.user_id = $2
+          AND oi.product_id_uuid = $3::uuid
+        LIMIT 1
+      `,
+      [parsed.data.order_id, req.user.id, parsed.data.product_id],
+    );
+    if (eligible.rowCount === 0) {
+      res.status(403).json({ error: "not_eligible" });
+      return;
+    }
+
+    const exists = await query(
+      `
+        SELECT 1
+        FROM reviews
+        WHERE user_id = $1 AND product_id = $2 AND order_id = $3
+        LIMIT 1
+      `,
+      [req.user.id, parsed.data.product_id, parsed.data.order_id],
+    );
+    if (exists.rowCount > 0) {
+      res.status(409).json({ error: "already_exists" });
       return;
     }
     const { rows } = await query(
@@ -1131,7 +2760,14 @@ app.post(
         VALUES ($1, $2, $3, $4, $5, $6, 'pending')
         RETURNING *
       `,
-      [req.user.id, product_id, order_id ?? null, rating, text, author_name ?? null],
+      [
+        req.user.id,
+        parsed.data.product_id,
+        parsed.data.order_id,
+        parsed.data.rating,
+        parsed.data.text,
+        parsed.data.author_name ?? null,
+      ],
     );
     res.json(mapReview(rows[0]));
   }),
@@ -1140,22 +2776,42 @@ app.post(
 app.post(
   "/api/orders",
   requireAuth,
+  rateLimit({ prefix: "orders-create", windowMs: 60 * 60 * 1000, max: 20, keyFn: (req) => req.user.id }),
   asyncHandler(async (req, res) => {
-    const {
-      order_number,
-      status,
-      total_price,
-      delivery_price,
-      delivery_method,
-      payment_method,
-      address,
-      items,
-      profile_name,
-    } = req.body || {};
-    if (!order_number || !total_price || !Array.isArray(items)) {
-      res.status(400).json({ error: "invalid_payload" });
+    const parsed = orderCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
       return;
     }
+
+    const uniqueProductIds = [...new Set(parsed.data.items.map((item) => item.product_id))];
+    const { rows: productRows } = await query(
+      `
+        SELECT id, name, price, images
+        FROM products
+        WHERE id = ANY($1::uuid[])
+      `,
+      [uniqueProductIds],
+    );
+    const productsById = productRows.reduce((acc, row) => {
+      acc[row.id] = row;
+      return acc;
+    }, {});
+
+    const missing = uniqueProductIds.filter((id) => !productsById[id]);
+    if (missing.length) {
+      res.status(400).json({ error: "products_not_found", ids: missing });
+      return;
+    }
+
+    const deliveryPrice = parsed.data.delivery_price ?? 0;
+    const itemsTotal = parsed.data.items.reduce((sum, item) => {
+      const productRow = productsById[item.product_id];
+      const price = toNumber(productRow.price) ?? 0;
+      return sum + price * item.quantity;
+    }, 0);
+
+    const totalPrice = itemsTotal + deliveryPrice;
     const { rows } = await query(
       `
         INSERT INTO orders (user_id, order_number, status, total_price, delivery_price, delivery_method, payment_method, address)
@@ -1164,36 +2820,515 @@ app.post(
       `,
       [
         req.user.id,
-        order_number,
-        status ?? "Новый",
-        total_price,
-        delivery_price ?? 0,
-        delivery_method ?? null,
-        payment_method ?? null,
-        address ?? null,
+        parsed.data.order_number,
+        parsed.data.status ?? "Новый",
+        totalPrice,
+        deliveryPrice,
+        parsed.data.delivery_method ?? null,
+        parsed.data.payment_method ?? null,
+        parsed.data.address ?? null,
       ],
     );
     const order = rows[0];
-    for (const item of items) {
+    for (const item of parsed.data.items) {
+      const productRow = productsById[item.product_id];
+      const images = Array.isArray(productRow.images) ? productRow.images : [];
+      const productImage = typeof images[0] === "string" ? images[0] : null;
+      const price = toNumber(productRow.price) ?? 0;
       await query(
         `
-          INSERT INTO order_items (order_id, product_id, product_name, product_image, price, quantity)
+          INSERT INTO order_items (order_id, product_id_uuid, product_name, product_image, price, quantity)
           VALUES ($1, $2, $3, $4, $5, $6)
         `,
         [
           order.id,
-          item.product_id,
-          item.product_name,
-          item.product_image ?? null,
-          item.price,
+          productRow.id,
+          productRow.name,
+          productImage,
+          price,
           item.quantity,
         ],
       );
     }
-    if (profile_name) {
-      await ensureProfile(req.user.id, req.user.phone ?? null, profile_name);
+    if (parsed.data.profile_name) {
+      await ensureProfile(req.user.id, req.user.phone ?? null, parsed.data.profile_name);
     }
+    const emailItems = parsed.data.items.map((item) => {
+      const productRow = productsById[item.product_id];
+      return {
+        product_name: productRow?.name ?? "Товар",
+        quantity: item.quantity,
+        price: toNumber(productRow?.price) ?? 0,
+      };
+    });
+    await maybeSendOrderEmails({
+      customerEmail: req.user.email ?? null,
+      orderNumber: parsed.data.order_number,
+      totalPrice,
+      deliveryPrice,
+      deliveryMethod: parsed.data.delivery_method ?? null,
+      paymentMethod: parsed.data.payment_method ?? null,
+      address: parsed.data.address ?? null,
+      items: emailItems,
+    });
     res.json(mapOrder(order));
+  }),
+);
+
+app.post(
+  "/api/orders/guest",
+  rateLimit({ prefix: "orders-guest-create", windowMs: 60 * 60 * 1000, max: 20, keyFn: (req) => req.ip }),
+  asyncHandler(async (req, res) => {
+    const parsed = guestOrderCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+
+    const normalizedEmail = parsed.data.customer_email.trim().toLowerCase();
+    const existingUser = await query(`SELECT id, phone FROM users WHERE email = $1`, [normalizedEmail]);
+    let userId = existingUser.rows[0]?.id;
+    if (!userId) {
+      const inserted = await query(
+        `
+          INSERT INTO users (email)
+          VALUES ($1)
+          RETURNING id
+        `,
+        [normalizedEmail],
+      );
+      userId = inserted.rows[0].id;
+    }
+    await ensureUserRole(userId, "user");
+
+    const uniqueProductIds = [...new Set(parsed.data.items.map((item) => item.product_id))];
+    const { rows: productRows } = await query(
+      `
+        SELECT id, name, price, images
+        FROM products
+        WHERE id = ANY($1::uuid[])
+      `,
+      [uniqueProductIds],
+    );
+    const productsById = productRows.reduce((acc, row) => {
+      acc[row.id] = row;
+      return acc;
+    }, {});
+    const missing = uniqueProductIds.filter((id) => !productsById[id]);
+    if (missing.length) {
+      res.status(400).json({ error: "products_not_found", ids: missing });
+      return;
+    }
+
+    const deliveryPrice = parsed.data.delivery_price ?? 0;
+    const itemsTotal = parsed.data.items.reduce((sum, item) => {
+      const productRow = productsById[item.product_id];
+      const price = toNumber(productRow.price) ?? 0;
+      return sum + price * item.quantity;
+    }, 0);
+    const totalPrice = itemsTotal + deliveryPrice;
+
+    const { rows } = await query(
+      `
+        INSERT INTO orders (user_id, order_number, status, total_price, delivery_price, delivery_method, payment_method, address)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `,
+      [
+        userId,
+        parsed.data.order_number,
+        parsed.data.status ?? "Новый",
+        totalPrice,
+        deliveryPrice,
+        parsed.data.delivery_method ?? null,
+        parsed.data.payment_method ?? null,
+        parsed.data.address ?? null,
+      ],
+    );
+    const order = rows[0];
+
+    for (const item of parsed.data.items) {
+      const productRow = productsById[item.product_id];
+      const images = Array.isArray(productRow.images) ? productRow.images : [];
+      const productImage = typeof images[0] === "string" ? images[0] : null;
+      const price = toNumber(productRow.price) ?? 0;
+      await query(
+        `
+          INSERT INTO order_items (order_id, product_id_uuid, product_name, product_image, price, quantity)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `,
+        [order.id, productRow.id, productRow.name, productImage, price, item.quantity],
+      );
+    }
+
+    if (parsed.data.profile_name) {
+      await ensureProfile(userId, existingUser.rows[0]?.phone ?? null, parsed.data.profile_name);
+    }
+
+    const emailItems = parsed.data.items.map((item) => {
+      const productRow = productsById[item.product_id];
+      return {
+        product_name: productRow?.name ?? "Товар",
+        quantity: item.quantity,
+        price: toNumber(productRow?.price) ?? 0,
+      };
+    });
+    await maybeSendOrderEmails({
+      customerEmail: normalizedEmail,
+      orderNumber: parsed.data.order_number,
+      totalPrice,
+      deliveryPrice,
+      deliveryMethod: parsed.data.delivery_method ?? null,
+      paymentMethod: parsed.data.payment_method ?? null,
+      address: parsed.data.address ?? null,
+      items: emailItems,
+    });
+
+    res.json(mapOrder(order));
+  }),
+);
+
+app.get(
+  "/api/my/profile",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await ensureProfile(req.user.id, req.user.phone ?? null, null);
+    const { rows } = await query(
+      `
+        SELECT u.id, u.email, u.phone, p.name
+        FROM users u
+        LEFT JOIN profiles p ON p.id = u.id
+        WHERE u.id = $1
+        LIMIT 1
+      `,
+      [req.user.id],
+    );
+    const profile = rows[0];
+    if (!profile) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json(mapProfile(profile));
+  }),
+);
+
+app.put(
+  "/api/my/profile",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = profileUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    await ensureProfile(req.user.id, req.user.phone ?? null, parsed.data.name);
+    const { rows } = await query(
+      `
+        SELECT u.id, u.email, u.phone, p.name
+        FROM users u
+        LEFT JOIN profiles p ON p.id = u.id
+        WHERE u.id = $1
+        LIMIT 1
+      `,
+      [req.user.id],
+    );
+    res.json(mapProfile(rows[0]));
+  }),
+);
+
+app.get(
+  "/api/my/addresses",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { rows } = await query(
+      `
+        SELECT *
+        FROM user_addresses
+        WHERE user_id = $1
+        ORDER BY is_default DESC, created_at DESC
+      `,
+      [req.user.id],
+    );
+    res.json(rows.map(mapUserAddress));
+  }),
+);
+
+app.post(
+  "/api/my/addresses",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = addressPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const created = await withTransaction(async (queryTx) => {
+      const shouldSetDefault = Boolean(parsed.data.is_default);
+      if (shouldSetDefault) {
+        await queryTx(`UPDATE user_addresses SET is_default = false, updated_at = now() WHERE user_id = $1`, [req.user.id]);
+      }
+      const { rows: countRows } = await queryTx(`SELECT COUNT(*)::int AS count FROM user_addresses WHERE user_id = $1`, [
+        req.user.id,
+      ]);
+      const forceDefault = (countRows[0]?.count ?? 0) === 0;
+      const { rows } = await queryTx(
+        `
+          INSERT INTO user_addresses (
+            user_id, label, recipient_name, phone, city, street, building, apartment, entrance, floor, comment, is_default
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          RETURNING *
+        `,
+        [
+          req.user.id,
+          parsed.data.label,
+          parsed.data.recipient_name,
+          parsed.data.phone,
+          parsed.data.city,
+          parsed.data.street,
+          parsed.data.building,
+          parsed.data.apartment ?? null,
+          parsed.data.entrance ?? null,
+          parsed.data.floor ?? null,
+          parsed.data.comment ?? null,
+          shouldSetDefault || forceDefault,
+        ],
+      );
+      return rows[0];
+    });
+    res.status(201).json(mapUserAddress(created));
+  }),
+);
+
+app.put(
+  "/api/my/addresses/:id",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = addressPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const updated = await withTransaction(async (queryTx) => {
+      if (parsed.data.is_default) {
+        await queryTx(`UPDATE user_addresses SET is_default = false, updated_at = now() WHERE user_id = $1`, [req.user.id]);
+      }
+      const { rows } = await queryTx(
+        `
+          UPDATE user_addresses
+          SET
+            label = $3,
+            recipient_name = $4,
+            phone = $5,
+            city = $6,
+            street = $7,
+            building = $8,
+            apartment = $9,
+            entrance = $10,
+            floor = $11,
+            comment = $12,
+            is_default = $13,
+            updated_at = now()
+          WHERE id = $1 AND user_id = $2
+          RETURNING *
+        `,
+        [
+          req.params.id,
+          req.user.id,
+          parsed.data.label,
+          parsed.data.recipient_name,
+          parsed.data.phone,
+          parsed.data.city,
+          parsed.data.street,
+          parsed.data.building,
+          parsed.data.apartment ?? null,
+          parsed.data.entrance ?? null,
+          parsed.data.floor ?? null,
+          parsed.data.comment ?? null,
+          Boolean(parsed.data.is_default),
+        ],
+      );
+      return rows[0] ?? null;
+    });
+    if (!updated) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json(mapUserAddress(updated));
+  }),
+);
+
+app.delete(
+  "/api/my/addresses/:id",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const deleted = await withTransaction(async (queryTx) => {
+      const { rows } = await queryTx(
+        `DELETE FROM user_addresses WHERE id = $1 AND user_id = $2 RETURNING *`,
+        [req.params.id, req.user.id],
+      );
+      const deletedAddress = rows[0] ?? null;
+      if (!deletedAddress) {
+        return null;
+      }
+      if (deletedAddress.is_default) {
+        await queryTx(
+          `
+            UPDATE user_addresses
+            SET is_default = true, updated_at = now()
+            WHERE id = (
+              SELECT id
+              FROM user_addresses
+              WHERE user_id = $1
+              ORDER BY created_at DESC
+              LIMIT 1
+            )
+          `,
+          [req.user.id],
+        );
+      }
+      return deletedAddress;
+    });
+    if (!deleted) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.status(204).end();
+  }),
+);
+
+app.get(
+  "/api/my/recommendations",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const rawLimit = Number.parseInt(String(req.query.limit ?? "8"), 10);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 24) : 8;
+
+    const { rows: historyRows } = await query(
+      `
+        SELECT
+          oi.product_id_uuid AS product_id,
+          COUNT(*)::int AS purchase_count,
+          MAX(o.created_at) AS last_order_at
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE o.user_id = $1 AND oi.product_id_uuid IS NOT NULL
+        GROUP BY oi.product_id_uuid
+      `,
+      [req.user.id],
+    );
+    const historyProductIds = historyRows
+      .map((row) => row.product_id)
+      .filter((value) => typeof value === "string");
+    const selectedIds = new Set();
+    const recommendations = [];
+
+    const { rows: coPurchaseRows } = await query(
+      `
+        WITH user_history_orders AS (
+          SELECT DISTINCT o.id, o.created_at
+          FROM orders o
+          JOIN order_items oi ON oi.order_id = o.id
+          WHERE o.user_id = $1 AND oi.product_id_uuid = ANY($2::uuid[])
+        ),
+        related_products AS (
+          SELECT
+            oi2.product_id_uuid AS product_id,
+            COUNT(*)::int AS score,
+            SUM(1.0 / (1.0 + EXTRACT(EPOCH FROM (now() - uho.created_at)) / 86400.0 / 30.0)) AS recency_score
+          FROM user_history_orders uho
+          JOIN order_items oi2 ON oi2.order_id = uho.id
+          WHERE oi2.product_id_uuid IS NOT NULL
+            AND oi2.product_id_uuid <> ALL($2::uuid[])
+          GROUP BY oi2.product_id_uuid
+        )
+        SELECT
+          p.*,
+          c.slug AS category_slug,
+          'co_purchase'::text AS recommendation_source,
+          rp.score AS recommendation_strength,
+          rp.recency_score AS recommendation_score
+        FROM related_products rp
+        JOIN products p ON p.id = rp.product_id
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE p.in_stock = true
+        ORDER BY rp.recency_score DESC, rp.score DESC, p.reviews_count DESC, p.rating DESC, p.created_at DESC
+        LIMIT $3
+      `,
+      [req.user.id, historyProductIds, limit],
+    );
+
+    if (coPurchaseRows.length > 0) {
+      for (const row of coPurchaseRows) {
+        selectedIds.add(row.id);
+        recommendations.push(mapRecommendationProduct(row));
+      }
+    }
+
+    if (recommendations.length < limit) {
+      const { rows: categoryRows } = await query(
+        `
+          WITH user_category_stats AS (
+            SELECT
+              p.category_id,
+              COUNT(*)::int AS purchases,
+              MAX(o.created_at) AS last_order_at
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            JOIN products p ON p.id = oi.product_id_uuid
+            WHERE o.user_id = $1 AND p.category_id IS NOT NULL
+            GROUP BY p.category_id
+          )
+          SELECT
+            p.*,
+            c.slug AS category_slug,
+            'category_affinity'::text AS recommendation_source,
+            ucs.purchases AS recommendation_strength,
+            (1.0 / (1.0 + EXTRACT(EPOCH FROM (now() - ucs.last_order_at)) / 86400.0 / 30.0)) AS recommendation_score
+          FROM products p
+          JOIN user_category_stats ucs ON ucs.category_id = p.category_id
+          LEFT JOIN categories c ON c.id = p.category_id
+          WHERE p.in_stock = true
+            AND p.id <> ALL($2::uuid[])
+            AND p.id <> ALL($3::uuid[])
+          ORDER BY recommendation_score DESC, ucs.purchases DESC, p.reviews_count DESC, p.rating DESC, p.created_at DESC
+          LIMIT $4
+        `,
+        [req.user.id, historyProductIds, [...selectedIds], limit - recommendations.length],
+      );
+      for (const row of categoryRows) {
+        if (selectedIds.has(row.id)) continue;
+        selectedIds.add(row.id);
+        recommendations.push(mapRecommendationProduct(row));
+      }
+    }
+
+    if (recommendations.length < limit) {
+      const { rows: fallbackRows } = await query(
+        `
+          SELECT
+            p.*,
+            c.slug AS category_slug,
+            'popular'::text AS recommendation_source,
+            COALESCE(p.reviews_count, 0)::int AS recommendation_strength,
+            COALESCE(p.rating, 0)::numeric AS recommendation_score
+          FROM products p
+          LEFT JOIN categories c ON c.id = p.category_id
+          WHERE p.in_stock = true
+            AND p.id <> ALL($1::uuid[])
+          ORDER BY p.reviews_count DESC, p.rating DESC, p.created_at DESC
+          LIMIT $2
+        `,
+        [[...selectedIds], limit - recommendations.length],
+      );
+      for (const row of fallbackRows) {
+        if (selectedIds.has(row.id)) continue;
+        selectedIds.add(row.id);
+        recommendations.push(mapRecommendationProduct(row));
+      }
+    }
+
+    res.json(recommendations.slice(0, limit));
   }),
 );
 
@@ -1250,6 +3385,277 @@ app.get(
       [req.params.id, req.user.id],
     );
     res.json(rows.map(mapOrderItem));
+  }),
+);
+
+app.get(
+  "/api/admin/home-layout",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (_req, res) => {
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'home_layout' LIMIT 1`);
+    const rawValue = rows[0]?.value ?? buildDefaultHomeLayout();
+    res.json(normalizeHomeLayout(rawValue));
+  }),
+);
+
+app.get(
+  "/api/admin/client-messages",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (_req, res) => {
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'client_messages' LIMIT 1`);
+    const rawValue = rows[0]?.value ?? buildDefaultClientMessages();
+    res.json(normalizeClientMessages(rawValue));
+  }),
+);
+
+app.put(
+  "/api/admin/client-messages",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = clientMessagesSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'client_messages' LIMIT 1`);
+    const current = normalizeClientMessages(rows[0]?.value ?? buildDefaultClientMessages());
+    const next = normalizeClientMessages({
+      ...current,
+      ...parsed.data,
+    });
+    await query(
+      `
+        INSERT INTO site_settings (key, value, updated_at)
+        VALUES ('client_messages', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `,
+      [JSON.stringify(next)],
+    );
+    res.status(204).end();
+  }),
+);
+
+app.get(
+  "/api/admin/theme",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (_req, res) => {
+    const theme = await getThemeSettings();
+    res.json(theme);
+  }),
+);
+
+app.put(
+  "/api/admin/theme",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = themeSettingsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const current = await getThemeSettings();
+    const next = normalizeThemeSettings({
+      ...current,
+      ...parsed.data,
+      palette: parsed.data.palette ?? current.palette,
+    });
+    await query(
+      `
+        INSERT INTO site_settings (key, value, updated_at)
+        VALUES ('theme_settings', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `,
+      [JSON.stringify(next)],
+    );
+    res.status(204).end();
+  }),
+);
+
+app.get(
+  "/api/admin/integrations",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (_req, res) => {
+    const settings = await getIntegrationSettings();
+    res.json(maskIntegrationSettingsForAdmin(settings));
+  }),
+);
+
+app.put(
+  "/api/admin/integrations",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = integrationProviderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const current = await getIntegrationSettings();
+    const update = parsed.data;
+    const merged = {
+      ...current,
+      ...update,
+      sms: { ...current.sms, ...(update.sms ?? {}) },
+      delivery: { ...current.delivery, ...(update.delivery ?? {}) },
+      payment: { ...current.payment, ...(update.payment ?? {}) },
+      mail: { ...current.mail, ...(update.mail ?? {}) },
+    };
+    if (typeof update.sms?.smscPassword === "string" && update.sms.smscPassword.trim().length === 0) {
+      merged.sms.smscPassword = current.sms.smscPassword;
+    }
+    if (typeof update.delivery?.cdekClientSecret === "string" && update.delivery.cdekClientSecret.trim().length === 0) {
+      merged.delivery.cdekClientSecret = current.delivery.cdekClientSecret;
+    }
+    if (typeof update.delivery?.yandexApiKey === "string" && update.delivery.yandexApiKey.trim().length === 0) {
+      merged.delivery.yandexApiKey = current.delivery.yandexApiKey;
+    }
+    if (typeof update.delivery?.ozonApiKey === "string" && update.delivery.ozonApiKey.trim().length === 0) {
+      merged.delivery.ozonApiKey = current.delivery.ozonApiKey;
+    }
+    if (typeof update.payment?.ozonPaymentKey === "string" && update.payment.ozonPaymentKey.trim().length === 0) {
+      merged.payment.ozonPaymentKey = current.payment.ozonPaymentKey;
+    }
+    if (typeof update.mail?.smtpPassword === "string" && update.mail.smtpPassword.trim().length === 0) {
+      merged.mail.smtpPassword = current.mail.smtpPassword;
+    }
+    const next = normalizeIntegrationSettings({
+      ...merged,
+    });
+    await query(
+      `
+        INSERT INTO site_settings (key, value, updated_at)
+        VALUES ('integration_settings', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `,
+      [JSON.stringify(next)],
+    );
+    res.status(204).end();
+  }),
+);
+
+const adminTestEmailSchema = z.object({
+  to: z.string().email().optional(),
+});
+
+app.post(
+  "/api/admin/integrations/test-email",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = adminTestEmailSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const integrations = await getIntegrationSettings();
+    const to = parsed.data.to ?? integrations.mail.notifyToEmail ?? integrations.mail.fromEmail;
+    if (!to) {
+      res.status(400).json({ error: "email_missing" });
+      return;
+    }
+    try {
+      await sendMailWithSmtp(integrations, {
+        to,
+        subject: "Тестовое письмо",
+        text: "Письмо отправлено успешно.",
+      });
+    } catch (error) {
+      res.status(502).json({ error: "email_send_failed", details: isProd ? undefined : String(error?.message ?? error) });
+      return;
+    }
+    res.status(204).end();
+  }),
+);
+
+app.get(
+  "/api/admin/home-layout/presets",
+  requireAuth,
+  requireRole("admin"),
+  (_req, res) => {
+    res.json(homeLayoutPresets);
+  },
+);
+
+app.post(
+  "/api/admin/home-layout/preview-preset",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = homeLayoutPresetSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const presetLayout = buildHomeLayoutPreset(parsed.data.preset);
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'home_layout' LIMIT 1`);
+    const currentLayout = rows[0]?.value ?? buildDefaultHomeLayout();
+    const nextLayout = applyHomeLayoutPreset(currentLayout, presetLayout, parsed.data.apply);
+    const diff = getHomeLayoutPreviewDiff(currentLayout, nextLayout);
+    res.json({
+      current: normalizeHomeLayout(currentLayout),
+      next: nextLayout,
+      ...diff,
+    });
+  }),
+);
+
+app.post(
+  "/api/admin/home-layout/apply-preset",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = homeLayoutPresetSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const presetLayout = buildHomeLayoutPreset(parsed.data.preset);
+    const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'home_layout' LIMIT 1`);
+    const currentLayout = rows[0]?.value ?? buildDefaultHomeLayout();
+    const nextLayout = applyHomeLayoutPreset(currentLayout, presetLayout, parsed.data.apply);
+    await query(
+      `
+        INSERT INTO site_settings (key, value, updated_at)
+        VALUES ('home_layout', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `,
+      [JSON.stringify(nextLayout)],
+    );
+    res.status(204).end();
+  }),
+);
+
+app.put(
+  "/api/admin/home-layout",
+  requireAuth,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = homeLayoutSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const normalized = normalizeHomeLayout(parsed.data);
+    await query(
+      `
+        INSERT INTO site_settings (key, value, updated_at)
+        VALUES ('home_layout', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+      `,
+      [JSON.stringify(normalized)],
+    );
+    res.status(204).end();
   }),
 );
 
@@ -1312,6 +3718,11 @@ app.post(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
+    const parsed = adminProductPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
     const {
       name,
       slug,
@@ -1333,55 +3744,69 @@ app.post(
       is_new,
       sort_order,
       category_ids,
-    } = req.body || {};
+    } = parsed.data;
     if (!name || !price) {
       res.status(400).json({ error: "invalid_payload" });
       return;
     }
-    const { rows } = await query(
-      `
-        INSERT INTO products (
-          name, slug, category_id, price, old_price, description, images,
-          meta_title, meta_description, meta_keywords, seo_text,
-          product_type, in_stock, stock_count, rating, reviews_count, is_premium, is_new, sort_order
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-        RETURNING *
-      `,
-      [
-        name,
-        slug ?? null,
-        category_id ?? null,
-        price,
-        old_price ?? null,
-        description ?? null,
-        images ?? null,
-        meta_title ?? null,
-        meta_description ?? null,
-        meta_keywords ?? null,
-        seo_text ?? null,
-        product_type ?? "regular",
-        in_stock ?? true,
-        stock_count ?? null,
-        rating ?? 0,
-        reviews_count ?? 0,
-        is_premium ?? false,
-        is_new ?? false,
-        sort_order ?? 0,
-      ],
-    );
-    const product = rows[0];
-    const normalizedCategoryIds = normalizeCategoryIds(category_ids);
-    if (normalizedCategoryIds.length > 0) {
-      for (const categoryId of normalizedCategoryIds) {
-        await query(
-          `
-            INSERT INTO product_categories (product_id, category_id)
-            VALUES ($1, $2)
-          `,
-          [product.id, categoryId],
-        );
+    const normalizedSlug = typeof slug === "string" && slug.trim().length > 0 ? slug.trim() : null;
+    const product = await withTransaction(async (queryTx) => {
+      if (normalizedSlug) {
+        const existing = await queryTx(`SELECT 1 FROM products WHERE slug = $1 LIMIT 1`, [normalizedSlug]);
+        if (existing.rowCount > 0) {
+          res.status(409).json({ error: "slug_taken" });
+          return null;
+        }
       }
+      const { rows } = await queryTx(
+        `
+          INSERT INTO products (
+            name, slug, category_id, price, old_price, description, images,
+            meta_title, meta_description, meta_keywords, seo_text,
+            product_type, in_stock, stock_count, rating, reviews_count, is_premium, is_new, sort_order
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          RETURNING *
+        `,
+        [
+          name,
+          normalizedSlug || null,
+          category_id ?? null,
+          price,
+          old_price ?? null,
+          description ?? null,
+          images ?? null,
+          meta_title ?? null,
+          meta_description ?? null,
+          meta_keywords ?? null,
+          seo_text ?? null,
+          product_type ?? "regular",
+          in_stock ?? true,
+          stock_count ?? null,
+          rating ?? 0,
+          reviews_count ?? 0,
+          is_premium ?? false,
+          is_new ?? false,
+          sort_order ?? 0,
+        ],
+      );
+      const created = rows[0];
+      const normalizedCategoryIds = normalizeCategoryIds(category_ids);
+      if (normalizedCategoryIds.length > 0) {
+        for (const categoryId of normalizedCategoryIds) {
+          await queryTx(
+            `
+              INSERT INTO product_categories (product_id, category_id)
+              VALUES ($1, $2)
+            `,
+            [created.id, categoryId],
+          );
+        }
+      }
+      return created;
+    });
+    if (!product) {
+      return;
     }
     res.json({ id: product.id });
   }),
@@ -1392,6 +3817,11 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
+    const parsed = adminProductPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
     const {
       name,
       slug,
@@ -1413,67 +3843,91 @@ app.put(
       is_new,
       sort_order,
       category_ids,
-    } = req.body || {};
-    await query(
-      `
-        UPDATE products
-        SET name = $2,
-            slug = $3,
-            category_id = $4,
-            price = $5,
-            old_price = $6,
-            description = $7,
-            images = $8,
-            meta_title = $9,
-            meta_description = $10,
-            meta_keywords = $11,
-            seo_text = $12,
-            product_type = $13,
-            in_stock = $14,
-            stock_count = $15,
-            rating = $16,
-            reviews_count = $17,
-            is_premium = $18,
-            is_new = $19,
-            sort_order = $20,
-            updated_at = now()
-        WHERE id = $1
-      `,
-      [
-        req.params.id,
-        name,
-        slug ?? null,
-        category_id ?? null,
-        price,
-        old_price ?? null,
-        description ?? null,
-        images ?? null,
-        meta_title ?? null,
-        meta_description ?? null,
-        meta_keywords ?? null,
-        seo_text ?? null,
-        product_type ?? "regular",
-        in_stock ?? true,
-        stock_count ?? null,
-        rating ?? 0,
-        reviews_count ?? 0,
-        is_premium ?? false,
-        is_new ?? false,
-        sort_order ?? 0,
-      ],
-    );
-    if (Array.isArray(category_ids)) {
-      await query(`DELETE FROM product_categories WHERE product_id = $1`, [req.params.id]);
-      const normalizedCategoryIds = normalizeCategoryIds(category_ids);
-      for (const categoryId of normalizedCategoryIds) {
-        await query(
-          `
-            INSERT INTO product_categories (product_id, category_id)
-            VALUES ($1, $2)
-          `,
-          [req.params.id, categoryId],
-        );
+    } = parsed.data;
+    const normalizedSlug = typeof slug === "string" && slug.trim().length > 0 ? slug.trim() : null;
+    const updated = await withTransaction(async (queryTx) => {
+      if (normalizedSlug) {
+        const existing = await queryTx(`SELECT 1 FROM products WHERE slug = $1 AND id <> $2 LIMIT 1`, [
+          normalizedSlug,
+          req.params.id,
+        ]);
+        if (existing.rowCount > 0) {
+          res.status(409).json({ error: "slug_taken" });
+          return null;
+        }
       }
+      const updateResult = await queryTx(
+        `
+          UPDATE products
+          SET name = $2,
+              slug = $3,
+              category_id = $4,
+              price = $5,
+              old_price = $6,
+              description = $7,
+              images = $8,
+              meta_title = $9,
+              meta_description = $10,
+              meta_keywords = $11,
+              seo_text = $12,
+              product_type = $13,
+              in_stock = $14,
+              stock_count = $15,
+              rating = $16,
+              reviews_count = $17,
+              is_premium = $18,
+              is_new = $19,
+              sort_order = $20,
+              updated_at = now()
+          WHERE id = $1
+        `,
+        [
+          req.params.id,
+          name,
+          normalizedSlug || null,
+          category_id ?? null,
+          price,
+          old_price ?? null,
+          description ?? null,
+          images ?? null,
+          meta_title ?? null,
+          meta_description ?? null,
+          meta_keywords ?? null,
+          seo_text ?? null,
+          product_type ?? "regular",
+          in_stock ?? true,
+          stock_count ?? null,
+          rating ?? 0,
+          reviews_count ?? 0,
+          is_premium ?? false,
+          is_new ?? false,
+          sort_order ?? 0,
+        ],
+      );
+      if (updateResult.rowCount === 0) {
+        return "not_found";
+      }
+      if (Array.isArray(category_ids)) {
+        await queryTx(`DELETE FROM product_categories WHERE product_id = $1`, [req.params.id]);
+        const normalizedCategoryIds = normalizeCategoryIds(category_ids);
+        for (const categoryId of normalizedCategoryIds) {
+          await queryTx(
+            `
+              INSERT INTO product_categories (product_id, category_id)
+              VALUES ($1, $2)
+            `,
+            [req.params.id, categoryId],
+          );
+        }
+      }
+      return "updated";
+    });
+    if (updated === null) {
+      return;
+    }
+    if (updated === "not_found") {
+      res.status(404).json({ error: "not_found" });
+      return;
     }
     res.status(204).end();
   }),
@@ -1484,7 +3938,11 @@ app.delete(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query(`DELETE FROM products WHERE id = $1`, [req.params.id]);
+    const deleted = await query(`DELETE FROM products WHERE id = $1`, [req.params.id]);
+    if (deleted.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1510,9 +3968,16 @@ app.post(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { name, slug, image, emoji, sort_order } = req.body || {};
-    if (!name || !slug) {
-      res.status(400).json({ error: "invalid_payload" });
+    const parsed = adminCategoryPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const { name, slug, image, emoji, sort_order } = parsed.data;
+    const normalizedSlug = slug.trim();
+    const existing = await query(`SELECT 1 FROM categories WHERE slug = $1 LIMIT 1`, [normalizedSlug]);
+    if (existing.rowCount > 0) {
+      res.status(409).json({ error: "slug_taken" });
       return;
     }
     await query(
@@ -1520,7 +3985,7 @@ app.post(
         INSERT INTO categories (name, slug, image, emoji, sort_order)
         VALUES ($1, $2, $3, $4, $5)
       `,
-      [name, slug, image ?? null, emoji ?? null, sort_order ?? 0],
+      [name, normalizedSlug, image ?? null, emoji ?? null, sort_order ?? 0],
     );
     res.status(204).end();
   }),
@@ -1531,8 +3996,22 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { name, slug, image, emoji, sort_order } = req.body || {};
-    await query(
+    const parsed = adminCategoryPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const { name, slug, image, emoji, sort_order } = parsed.data;
+    const normalizedSlug = slug.trim();
+    const existing = await query(`SELECT 1 FROM categories WHERE slug = $1 AND id <> $2 LIMIT 1`, [
+      normalizedSlug,
+      req.params.id,
+    ]);
+    if (existing.rowCount > 0) {
+      res.status(409).json({ error: "slug_taken" });
+      return;
+    }
+    const updateResult = await query(
       `
         UPDATE categories
         SET name = $2,
@@ -1542,8 +4021,12 @@ app.put(
             sort_order = $6
         WHERE id = $1
       `,
-      [req.params.id, name, slug, image ?? null, emoji ?? null, sort_order ?? 0],
+      [req.params.id, name, normalizedSlug, image ?? null, emoji ?? null, sort_order ?? 0],
     );
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1553,7 +4036,11 @@ app.delete(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query(`DELETE FROM categories WHERE id = $1`, [req.params.id]);
+    const deleted = await query(`DELETE FROM categories WHERE id = $1`, [req.params.id]);
+    if (deleted.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1573,6 +4060,11 @@ app.post(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
+    const parsed = adminBannerPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
     const {
       title,
       subtitle,
@@ -1584,15 +4076,28 @@ app.post(
       position,
       is_active,
       sort_order,
-    } = req.body || {};
-    if (!title) {
-      res.status(400).json({ error: "invalid_payload" });
+      starts_at,
+      ends_at,
+    } =
+      parsed.data;
+    const startsAtParsed = parseOptionalTimestamp(starts_at);
+    const endsAtParsed = parseOptionalTimestamp(ends_at);
+    if (!startsAtParsed.valid || !endsAtParsed.valid) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_datetime" } });
+      return;
+    }
+    if (
+      startsAtParsed.value &&
+      endsAtParsed.value &&
+      new Date(startsAtParsed.value).getTime() > new Date(endsAtParsed.value).getTime()
+    ) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_window" } });
       return;
     }
     await query(
       `
-        INSERT INTO banners (title, subtitle, discount, link_url, link_text, variant, image, position, is_active, sort_order)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        INSERT INTO banners (title, subtitle, discount, link_url, link_text, variant, image, position, is_active, starts_at, ends_at, sort_order)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       `,
       [
         title,
@@ -1604,6 +4109,8 @@ app.post(
         image ?? null,
         position ?? "home",
         is_active ?? true,
+        startsAtParsed.value,
+        endsAtParsed.value,
         sort_order ?? 0,
       ],
     );
@@ -1616,6 +4123,11 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
+    const parsed = adminBannerPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
     const {
       title,
       subtitle,
@@ -1627,8 +4139,25 @@ app.put(
       position,
       is_active,
       sort_order,
-    } = req.body || {};
-    await query(
+      starts_at,
+      ends_at,
+    } =
+      parsed.data;
+    const startsAtParsed = parseOptionalTimestamp(starts_at);
+    const endsAtParsed = parseOptionalTimestamp(ends_at);
+    if (!startsAtParsed.valid || !endsAtParsed.valid) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_datetime" } });
+      return;
+    }
+    if (
+      startsAtParsed.value &&
+      endsAtParsed.value &&
+      new Date(startsAtParsed.value).getTime() > new Date(endsAtParsed.value).getTime()
+    ) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_window" } });
+      return;
+    }
+    const updateResult = await query(
       `
         UPDATE banners
         SET title = $2,
@@ -1640,7 +4169,9 @@ app.put(
             image = $8,
             position = $9,
             is_active = $10,
-            sort_order = $11,
+            starts_at = $11,
+            ends_at = $12,
+            sort_order = $13,
             updated_at = now()
         WHERE id = $1
       `,
@@ -1655,9 +4186,15 @@ app.put(
         image ?? null,
         position ?? "home",
         is_active ?? true,
+        startsAtParsed.value,
+        endsAtParsed.value,
         sort_order ?? 0,
       ],
     );
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1667,7 +4204,11 @@ app.delete(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query(`DELETE FROM banners WHERE id = $1`, [req.params.id]);
+    const deleted = await query(`DELETE FROM banners WHERE id = $1`, [req.params.id]);
+    if (deleted.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1699,17 +4240,32 @@ app.post(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { product_id, badge, is_active, sort_order } = req.body || {};
-    if (!product_id) {
-      res.status(400).json({ error: "invalid_payload" });
+    const parsed = adminHeroPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const { product_id, badge, is_active, sort_order, starts_at, ends_at } = parsed.data;
+    const startsAtParsed = parseOptionalTimestamp(starts_at);
+    const endsAtParsed = parseOptionalTimestamp(ends_at);
+    if (!startsAtParsed.valid || !endsAtParsed.valid) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_datetime" } });
+      return;
+    }
+    if (
+      startsAtParsed.value &&
+      endsAtParsed.value &&
+      new Date(startsAtParsed.value).getTime() > new Date(endsAtParsed.value).getTime()
+    ) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_window" } });
       return;
     }
     await query(
       `
-        INSERT INTO hero_products (product_id, badge, is_active, sort_order)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO hero_products (product_id, badge, is_active, starts_at, ends_at, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6)
       `,
-      [product_id, badge ?? null, is_active ?? true, sort_order ?? 0],
+      [product_id, badge ?? null, is_active ?? true, startsAtParsed.value, endsAtParsed.value, sort_order ?? 0],
     );
     res.status(204).end();
   }),
@@ -1720,18 +4276,51 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { product_id, badge, is_active, sort_order } = req.body || {};
-    await query(
+    const parsed = adminHeroPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const { product_id, badge, is_active, sort_order, starts_at, ends_at } = parsed.data;
+    const startsAtParsed = parseOptionalTimestamp(starts_at);
+    const endsAtParsed = parseOptionalTimestamp(ends_at);
+    if (!startsAtParsed.valid || !endsAtParsed.valid) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_datetime" } });
+      return;
+    }
+    if (
+      startsAtParsed.value &&
+      endsAtParsed.value &&
+      new Date(startsAtParsed.value).getTime() > new Date(endsAtParsed.value).getTime()
+    ) {
+      res.status(400).json({ error: "invalid_payload", details: { schedule: "invalid_window" } });
+      return;
+    }
+    const updateResult = await query(
       `
         UPDATE hero_products
         SET product_id = $2,
             badge = $3,
             is_active = $4,
-            sort_order = $5
+            starts_at = $5,
+            ends_at = $6,
+            sort_order = $7
         WHERE id = $1
       `,
-      [req.params.id, product_id, badge ?? null, is_active ?? true, sort_order ?? 0],
+      [
+        req.params.id,
+        product_id,
+        badge ?? null,
+        is_active ?? true,
+        startsAtParsed.value,
+        endsAtParsed.value,
+        sort_order ?? 0,
+      ],
     );
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1741,7 +4330,11 @@ app.delete(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query(`DELETE FROM hero_products WHERE id = $1`, [req.params.id]);
+    const deleted = await query(`DELETE FROM hero_products WHERE id = $1`, [req.params.id]);
+    if (deleted.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1773,8 +4366,19 @@ app.post(
       status,
       related_product_ids,
     } = req.body || {};
-    if (!title || !slug) {
+    const normalizedSlug = typeof slug === "string" ? slug.trim() : "";
+    if (!title || !normalizedSlug) {
       res.status(400).json({ error: "invalid_payload" });
+      return;
+    }
+    const normalizedStatus = status ?? "draft";
+    if (normalizedStatus !== "draft" && normalizedStatus !== "published") {
+      res.status(400).json({ error: "invalid_status" });
+      return;
+    }
+    const existing = await query(`SELECT 1 FROM articles WHERE slug = $1 LIMIT 1`, [normalizedSlug]);
+    if (existing.rowCount > 0) {
+      res.status(409).json({ error: "slug_taken" });
       return;
     }
     await query(
@@ -1787,14 +4391,14 @@ app.post(
       `,
       [
         title,
-        slug,
+        normalizedSlug,
         category ?? "",
         excerpt ?? null,
         content ?? null,
         cover_image ?? null,
         meta_title ?? null,
         meta_description ?? null,
-        status ?? "draft",
+        normalizedStatus,
         related_product_ids ?? null,
       ],
     );
@@ -1819,7 +4423,25 @@ app.put(
       status,
       related_product_ids,
     } = req.body || {};
-    await query(
+    const normalizedSlug = typeof slug === "string" ? slug.trim() : "";
+    if (!title || !normalizedSlug) {
+      res.status(400).json({ error: "invalid_payload" });
+      return;
+    }
+    const normalizedStatus = status ?? "draft";
+    if (normalizedStatus !== "draft" && normalizedStatus !== "published") {
+      res.status(400).json({ error: "invalid_status" });
+      return;
+    }
+    const existing = await query(`SELECT 1 FROM articles WHERE slug = $1 AND id <> $2 LIMIT 1`, [
+      normalizedSlug,
+      req.params.id,
+    ]);
+    if (existing.rowCount > 0) {
+      res.status(409).json({ error: "slug_taken" });
+      return;
+    }
+    const updateResult = await query(
       `
         UPDATE articles
         SET title = $2,
@@ -1838,17 +4460,21 @@ app.put(
       [
         req.params.id,
         title,
-        slug,
+        normalizedSlug,
         category ?? "",
         excerpt ?? null,
         content ?? null,
         cover_image ?? null,
         meta_title ?? null,
         meta_description ?? null,
-        status ?? "draft",
+        normalizedStatus,
         related_product_ids ?? null,
       ],
     );
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1858,7 +4484,11 @@ app.delete(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query(`DELETE FROM articles WHERE id = $1`, [req.params.id]);
+    const deleted = await query(`DELETE FROM articles WHERE id = $1`, [req.params.id]);
+    if (deleted.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1878,8 +4508,12 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { title, content } = req.body || {};
-    await query(
+    const parsed = adminPageUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const updateResult = await query(
       `
         UPDATE pages
         SET title = $2,
@@ -1887,8 +4521,12 @@ app.put(
             updated_at = now()
         WHERE id = $1
       `,
-      [req.params.id, title, content ?? ""],
+      [req.params.id, parsed.data.title, parsed.data.content ?? ""],
     );
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1932,8 +4570,19 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { status } = req.body || {};
-    await query(`UPDATE orders SET status = $2 WHERE id = $1`, [req.params.id, status]);
+    const parsed = adminOrderStatusUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
+    const updateResult = await query(`UPDATE orders SET status = $2 WHERE id = $1`, [
+      req.params.id,
+      parsed.data.status,
+    ]);
+    if (updateResult.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     res.status(204).end();
   }),
 );
@@ -1960,11 +4609,12 @@ app.post(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { user_id, product_id, order_id, rating, text, author_name, status } = req.body || {};
-    if (!user_id || !product_id || !rating || !text) {
-      res.status(400).json({ error: "invalid_payload" });
+    const parsed = adminReviewCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
       return;
     }
+    const { user_id, product_id, order_id, rating, text, author_name, status } = parsed.data;
     const { rows } = await query(
       `
         INSERT INTO reviews (user_id, product_id, order_id, rating, text, author_name, status)
@@ -1983,7 +4633,11 @@ app.put(
   requireAuth,
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { status } = req.body || {};
+    const parsed = adminReviewStatusUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+      return;
+    }
     const updated = await query(
       `
         UPDATE reviews
@@ -1991,8 +4645,12 @@ app.put(
         WHERE id = $1
         RETURNING product_id
       `,
-      [req.params.id, status],
+      [req.params.id, parsed.data.status],
     );
+    if (updated.rowCount === 0) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     const productId = updated.rows[0]?.product_id;
     if (productId) {
       await recalculateProductRating(productId);
@@ -2017,10 +4675,30 @@ app.delete(
   }),
 );
 
-app.post("/api/payments/create", (req, res) => {
+app.post("/api/payments/create", requireAuth, asyncHandler(async (req, res) => {
   const parsed = paymentCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
+    return;
+  }
+
+  const orderResult = await query(`SELECT id, user_id, total_price FROM orders WHERE id = $1 LIMIT 1`, [
+    parsed.data.orderId,
+  ]);
+  const order = orderResult.rows[0];
+  if (!order) {
+    res.status(404).json({ error: "order_not_found" });
+    return;
+  }
+  if (order.user_id !== req.user.id) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+
+  const integrations = await getIntegrationSettings();
+  const paymentProvider = integrations.payment.provider ?? "manual";
+  if (paymentProvider === "ozon" && !integrations.payment.ozonPaymentKey) {
+    res.status(400).json({ error: "integration_not_configured", provider: "ozon" });
     return;
   }
 
@@ -2028,7 +4706,7 @@ app.post("/api/payments/create", (req, res) => {
   const payment = {
     id: paymentId,
     orderId: parsed.data.orderId,
-    amount: parsed.data.amount,
+    amount: toNumber(order.total_price) ?? 0,
     currency: parsed.data.currency,
     status: "pending",
     createdAt: new Date().toISOString(),
@@ -2040,11 +4718,11 @@ app.post("/api/payments/create", (req, res) => {
     paymentId,
     status: payment.status,
     redirectUrl: null,
-    provider: "placeholder",
+    provider: paymentProvider,
   });
-});
+}));
 
-app.post("/api/payments/webhook", (req, res) => {
+app.post("/api/payments/webhook", requireWebhook, (req, res) => {
   const parsed = paymentWebhookSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
@@ -2064,14 +4742,46 @@ app.post("/api/payments/webhook", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/delivery/quote", (req, res) => {
+app.post("/api/delivery/quote", requireAuth, asyncHandler(async (req, res) => {
   const parsed = deliveryQuoteSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
     return;
   }
 
-  const totalItems = parsed.data.items.reduce((sum, item) => sum + item.quantity, 0);
+  const orderResult = await query(`SELECT id FROM orders WHERE id = $1 AND user_id = $2 LIMIT 1`, [
+    parsed.data.orderId,
+    req.user.id,
+  ]);
+  if (orderResult.rowCount === 0) {
+    res.status(404).json({ error: "order_not_found" });
+    return;
+  }
+
+  const integrations = await getIntegrationSettings();
+  const deliveryProvider = integrations.delivery.provider ?? "none";
+  if (deliveryProvider === "cdek" && (!integrations.delivery.cdekClientId || !integrations.delivery.cdekClientSecret)) {
+    res.status(400).json({ error: "integration_not_configured", provider: "cdek" });
+    return;
+  }
+  if (deliveryProvider === "yandex" && !integrations.delivery.yandexApiKey) {
+    res.status(400).json({ error: "integration_not_configured", provider: "yandex" });
+    return;
+  }
+  if (deliveryProvider === "ozon" && (!integrations.delivery.ozonClientId || !integrations.delivery.ozonApiKey)) {
+    res.status(400).json({ error: "integration_not_configured", provider: "ozon" });
+    return;
+  }
+
+  const itemsResult = await query(
+    `
+      SELECT COALESCE(SUM(oi.quantity), 0) AS total_items
+      FROM order_items oi
+      WHERE oi.order_id = $1
+    `,
+    [parsed.data.orderId],
+  );
+  const totalItems = toNumber(itemsResult.rows[0]?.total_items) ?? 0;
   const basePrice = 250;
   const perItem = 20 * totalItems;
   const quoteId = randomUUID();
@@ -2083,16 +4793,28 @@ app.post("/api/delivery/quote", (req, res) => {
     price,
     currency: "RUB",
     etaDays: 3,
-    provider: "placeholder",
+    provider: deliveryProvider,
   });
-});
+}));
 
-app.post("/api/delivery/create", (req, res) => {
+app.post("/api/delivery/create", requireAuth, asyncHandler(async (req, res) => {
   const parsed = deliveryCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
     return;
   }
+
+  const orderResult = await query(`SELECT id FROM orders WHERE id = $1 AND user_id = $2 LIMIT 1`, [
+    parsed.data.orderId,
+    req.user.id,
+  ]);
+  if (orderResult.rowCount === 0) {
+    res.status(404).json({ error: "order_not_found" });
+    return;
+  }
+
+  const integrations = await getIntegrationSettings();
+  const deliveryProvider = integrations.delivery.provider ?? "none";
 
   const deliveryId = randomUUID();
   const delivery = {
@@ -2101,6 +4823,7 @@ app.post("/api/delivery/create", (req, res) => {
     quoteId: parsed.data.quoteId,
     status: "new",
     createdAt: new Date().toISOString(),
+    userId: req.user.id,
   };
 
   deliveries.set(deliveryId, delivery);
@@ -2109,11 +4832,11 @@ app.post("/api/delivery/create", (req, res) => {
     deliveryId,
     status: delivery.status,
     trackingUrl: null,
-    provider: "placeholder",
+    provider: deliveryProvider,
   });
-});
+}));
 
-app.post("/api/delivery/webhook", (req, res) => {
+app.post("/api/delivery/webhook", requireWebhook, (req, res) => {
   const parsed = deliveryWebhookSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
@@ -2133,7 +4856,7 @@ app.post("/api/delivery/webhook", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/sms/request", (req, res) => {
+app.post("/api/sms/request", requireWebhook, (req, res) => {
   const parsed = smsRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
@@ -2179,7 +4902,7 @@ app.post("/api/sms/request", (req, res) => {
   });
 });
 
-app.post("/api/sms/verify", (req, res) => {
+app.post("/api/sms/verify", requireWebhook, (req, res) => {
   const parsed = smsVerifySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
@@ -2223,7 +4946,7 @@ app.post("/api/sms/verify", (req, res) => {
   res.json({ verified: true });
 });
 
-app.post("/api/sms/webhook", (req, res) => {
+app.post("/api/sms/webhook", requireWebhook, (req, res) => {
   const parsed = smsWebhookSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "invalid_payload", details: parsed.error.flatten() });
@@ -2240,10 +4963,33 @@ app.post("/api/sms/webhook", (req, res) => {
   res.json({ ok: true });
 });
 
+app.use((err, _req, res, _next) => {
+  const name = err && typeof err === "object" && "name" in err ? err.name : null;
+  const message = err && typeof err === "object" && "message" in err ? err.message : "server_error";
+  if (name === "MulterError" || message === "invalid_file_type") {
+    res.status(400).json({ error: message });
+    return;
+  }
+  res.status(500).json({ error: isProd ? "server_error" : message });
+});
+
 export const createServer = () => app;
 
 export const startServer = async (overridePort) => {
+  if (isProd) {
+    if (!process.env.AUTH_TOKEN_SECRET || process.env.AUTH_TOKEN_SECRET === "dev-secret") {
+      throw new Error("AUTH_TOKEN_SECRET must be set");
+    }
+    if (!process.env.SMS_OTP_SECRET || process.env.SMS_OTP_SECRET === "dev-secret") {
+      throw new Error("SMS_OTP_SECRET must be set");
+    }
+    if (!process.env.WEBHOOK_SECRET) {
+      throw new Error("WEBHOOK_SECRET must be set");
+    }
+  }
   await ensureSchema();
+  await query(`DELETE FROM auth_sessions WHERE expires_at <= now()`);
+  await query(`DELETE FROM otp_requests WHERE expires_at <= now()`);
   await ensureAdminUser();
   const port = overridePort ?? basePort;
   return app.listen(port, () => {
